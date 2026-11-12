@@ -1,0 +1,68 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  smoke:
+    name: 语法检查 + 端到端冒烟
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # 本项目零 npm 依赖（node:http + node:sqlite），因此没有 install 步骤。
+    # 只跑 Node 24.x：node:sqlite 在该版本无需实验性开关。
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24.x'
+
+      - name: 打印版本
+        run: node -v && npm -v
+
+      - name: 语法检查（全部 .mjs）
+        run: |
+          set -e
+          files=$(git ls-files '*.mjs')
+          for f in $files; do node --check "$f"; done
+          echo "checked: $(echo "$files" | wc -l) files"
+
+      - name: 启动服务（隔离数据库 + mock 模型）
+        env:
+          PORT: '5197'
+          HOST: '127.0.0.1'
+          BIDCORE_DB: ${{ github.workspace }}/.ci/ci.db
+          LLM_MODE: mock
+          BIDCORE_LOG: '0'
+        run: |
+          set -e
+          mkdir -p .ci
+          node server/index.mjs > .ci/server.log 2>&1 &
+          for i in $(seq 1 80); do
+            if curl -fsS http://127.0.0.1:5197/api/health > /dev/null; then
+              echo "server up after $((i*500))ms"; cat .ci/server.log; exit 0
+            fi
+            sleep 0.5
+          done
+          echo "server failed to start"; cat .ci/server.log; exit 1
+
+      - name: 冒烟测试（42 通过 / 1 跳过 为基线）
+        env:
+          BIDCORE_BASE: http://127.0.0.1:5197
+        run: node server/smoke.mjs
+
+      - name: 服务日志（失败时排查用）
+        if: failure()
+        run: cat .ci/server.log || true
