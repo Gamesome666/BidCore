@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: 安全问题 / 漏洞
+    url: https://github.com/Gamesome666/BidCore/security/policy
+    about: 请勿公开提交，按 SECURITY.md 走私密渠道
+  - name: 使用问题 / 讨论
+    url: https://github.com/Gamesome666/BidCore/discussions
+    about: 跑不起来、配置不懂、想看思路，来这里聊

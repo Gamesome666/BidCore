@@ -1,0 +1,39 @@
+{
+  "name": "bidcore",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "BidCore · 标序 — 可人工干预的 Multi-Agent 投标标书编排平台（零依赖 / Node 24 / node:sqlite）",
+  "keywords": [
+    "bid",
+    "tender",
+    "proposal",
+    "multi-agent",
+    "workflow-engine",
+    "hitl",
+    "human-in-the-loop",
+    "llm",
+    "sqlite",
+    "zero-dependency",
+    "nodejs"
+  ],
+  "homepage": "https://github.com/Gamesome666/BidCore#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Gamesome666/BidCore.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Gamesome666/BidCore/issues"
+  },
+  "engines": { "node": ">=22.13" },
+  "scripts": {
+    "start": "node server/index.mjs",
+    "dev": "node --watch server/index.mjs",
+    "reset": "node server/reset.mjs",
+    "smoke": "node server/smoke.mjs",
+    "demo": "node tools/demo.mjs",
+    "shot": "node tools/shot.mjs",
+    "probe": "node tools/probe-llm.mjs"
+  },
+  "license": "MIT"
+}

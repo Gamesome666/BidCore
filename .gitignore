@@ -1,0 +1,46 @@
+# ── 运行时数据（SQLite 库 / WAL / 导出文件 / 调试截图）
+var/*
+!var/.gitkeep
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+*.docx
+!docs/**/*.docx
+
+# ── 本地配置与密钥（示例文件除外）
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# ── 依赖与构建（本项目零依赖，仅防御性忽略）
+node_modules/
+dist/
+build/
+coverage/
+.pnpm-store/
+
+# ── 日志与临时产物
+*.log
+npm-debug.log*
+yarn-error.log*
+*.tmp
+*.bak
+*.orig
+*.rej
+
+# ── 非本项目内容的本地残留（TTS 试验等），不入库
+/demo/
+
+# ── 编辑器 / 操作系统
+.vscode/
+!.vscode/extensions.json
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+desktop.ini

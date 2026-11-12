@@ -1,0 +1,74 @@
+name: Bug 报告
+description: 报告一个可复现的缺陷
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        提交前请先跑一遍 `node server/smoke.mjs`，确认不是本地数据/配置问题。
+        安全相关问题请走 SECURITY.md 的私密渠道，不要在这里公开。
+
+  - type: textarea
+    id: what
+    attributes:
+      label: 现象
+      description: 发生了什么？期望是什么？
+      placeholder: 在 `#/reviews/:id` 点「驳回」后页面白屏，期望出现确认弹窗
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: 复现步骤
+      placeholder: |
+        1. node server/index.mjs
+        2. 用 admin/admin123 登录
+        3. 进入 #/reviews ，打开第一条
+        4. 点「驳回」
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: 期望行为
+    validations:
+      required: false
+
+  - type: input
+    id: version
+    attributes:
+      label: 版本 / 提交
+      description: `git rev-parse --short HEAD` 的输出，或 npm 包版本
+      placeholder: d1f2a3b
+    validations:
+      required: true
+
+  - type: input
+    id: node
+    attributes:
+      label: Node 版本与系统
+      placeholder: Node 24.15.0 / Windows 11
+    validations:
+      required: true
+
+  - type: dropdown
+    id: llm
+    attributes:
+      label: 模型模式
+      options:
+        - mock（未配置 .env）
+        - openai 兼容网关（真实模型）
+        - 两者都试了
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: 日志 / 截图
+      description: 服务端控制台、浏览器 console、`var/` 里的报错都行。**请先删掉 key 和业务敏感信息。**
+      render: shell
+    validations:
+      required: false
