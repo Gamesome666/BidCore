@@ -1,6 +1,7 @@
 # BidCore · 标序
 
 <p align="center">
+  <a href="https://github.com/Gamesome666/BidCore/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/Gamesome666/BidCore/actions/workflows/ci.yml/badge.svg"></a>
   <img alt="Node" src="https://img.shields.io/badge/node-%E2%89%A522.13-3c873a?logo=node.js&logoColor=white">
   <img alt="dependencies" src="https://img.shields.io/badge/npm%20deps-0-brightgreen">
   <img alt="build step" src="https://img.shields.io/badge/build-none-blue">
