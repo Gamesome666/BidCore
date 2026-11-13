@@ -22,6 +22,7 @@ import {
   checkRejection, checkDuplicate, buildDeviationRows, validateExport, composeProjectMarkdown,
   checkCompliance, duplicateReport,
 } from './bid.mjs';
+import { buildQualificationPack, attachKnowledgeRefs } from './qualification.mjs';
 
 /** 业务错误：路由层据此转成 4xx（而不是 500） */
 export class StepError extends Error {
@@ -551,7 +552,81 @@ export function createProjectExport(projectId, user = null) {
   const validation = validateExport({ project, state });
   if (!validation.ok) return { ok: false, validation };
 
-  const markdown = composeProjectMarkdown({ project, state });
+  // 商务/资格证据链：按招标「第三章 资格审查」条款检索知识库，回写 refs.knowledge
+  const pack = buildQualificationPack({ project, state });
+  const stateWithPack = mutateState(projectId, (draft) => {
+    draft.qualification_pack = pack.summary;
+    attachKnowledgeRefs(draft.outline, pack.refs);
+
+    // 存量数据自愈（老项目正文里缓存了旧模板句/被表格污染的事实，导出时兜底修正）
+    const nodeMarkdown = draft.content?.markdown_by_node || {};
+    const LEGACY_CERT_SENTENCE = /资格类证书（[^）]{0,80}）均在有效期内/g;
+    const CERT_REPLACEMENT = '资格类证书按招标文件《第三章 资格审查》逐项提供，证书名称、编号与有效期见《附录C 商务资格与证明材料》';
+    for (const [nodeId, body] of Object.entries(nodeMarkdown)) {
+      if (typeof body === 'string' && body.includes('资格类证书（')) {
+        nodeMarkdown[nodeId] = body.replace(LEGACY_CERT_SENTENCE, CERT_REPLACEMENT);
+      }
+    }
+
+    // 事实被「改编清单」表格行污染时：重算事实，并把正文里嵌着的旧值替换成新值
+    const factsBefore = draft.global_facts?.facts || [];
+    const polluted = factsBefore.some((fact) => /^A-\d{2}\b/.test(String(fact.value || '')) || String(fact.value || '').includes('\t'));
+    if (polluted) {
+      const rebuilt = buildGlobalFacts({
+        analysis: draft.bid_analysis || {},
+        project,
+        text: project.tender_text || '',
+      });
+      const freshByKey = new Map(rebuilt.facts.map((fact) => [fact.key, fact.value]));
+      const replacements = factsBefore
+        .filter((fact) => /^A-\d{2}\b/.test(String(fact.value || '')) || String(fact.value || '').includes('\t'))
+        .map((fact) => [String(fact.value), String(freshByKey.get(fact.key) || '')])
+        .filter(([oldValue, newValue]) => oldValue && newValue && oldValue !== newValue);
+      draft.global_facts = rebuilt;
+      for (const [nodeId, body] of Object.entries(nodeMarkdown)) {
+        if (typeof body !== 'string') continue;
+        let next = body;
+        for (const [oldValue, newValue] of replacements) next = next.split(oldValue).join(newValue);
+        if (next !== body) nodeMarkdown[nodeId] = next;
+      }
+    }
+
+    // 正文里残留的「改编清单」行（A-01 原厂/驻场、A-06 质保期这类）统一洗掉，
+    // 避免表格行原样进正式标书；能定位到事实键的，用修正后的事实值替换。
+    const factMap = new Map((draft.global_facts?.facts || []).map((fact) => [fact.key, fact.value]));
+    const WATERMARK = /演示改编稿\s*·?\s*非采购人发布的正式文件\s*·?\s*不得用于实际投标|演示改编稿|演示用虚构样本/g;
+    const BOILERPLATE = /演示改编稿|非采购人发布的正式文件|不得用于实际投标|演示用虚构样本/;
+    // 存量解析结果里被当成条款的演示水印，一并从需求列表与偏离表剔除
+    if (Array.isArray(draft.bid_analysis?.requirements)) {
+      draft.bid_analysis.requirements = draft.bid_analysis.requirements.filter((req) => !BOILERPLATE.test(String(req.text || '')));
+    }
+    if (Array.isArray(draft.analysisRaw?.requirements)) {
+      draft.analysisRaw.requirements = draft.analysisRaw.requirements.filter((req) => !BOILERPLATE.test(String(req.text || '')));
+    }
+    if (Array.isArray(draft.deviation?.rows)) {
+      draft.deviation.rows = draft.deviation.rows.filter((row) => !BOILERPLATE.test(String(row.requirement || '')));
+    }
+    for (const [nodeId, body] of Object.entries(nodeMarkdown)) {
+      if (typeof body !== 'string') continue;
+      let cleaned = body;
+      if (cleaned.includes('A-0')) {
+        cleaned = cleaned
+          .replace(/（依据：[^）]*A-0\d[^）]*）\s*/g, '')
+          .replace(/(质保期|驻场团队)\s*A-0\d[^。；\n]{0,200}/g, (_m, key) => `${key}：${factMap.get(key) || '按招标文件约定'}`)
+          .replace(/A-0\d[^。；\n]{0,200}/g, '按招标文件约定');
+      }
+      cleaned = cleaned
+        .replace(WATERMARK, '')
+        .replace(/：\s*。/g, '。')
+        .replace(/；\s*；/g, '；')
+        .replace(/\d+\)\s*；/g, '')
+        .replace(/：\s*；/g, '：');
+      if (cleaned !== body) nodeMarkdown[nodeId] = cleaned;
+    }
+    return draft;
+  });
+
+  const markdown = composeProjectMarkdown({ project, state: stateWithPack, extras: { qualificationMarkdown: pack.markdown } });
   const fileName = exportFileName(projectId);
   const filePath = path.join(VAR_DIR, 'files', fileName);
   const { size } = writeDocx(filePath, markdown, { title: `${project.name} 技术方案`, author: project.bidder_name || 'BidCore' });

@@ -108,11 +108,15 @@ const RULE_META = {
   'ACC-01': { dimension: 'accuracy', weight: 0.35, label: '事实一致性' },
   'ACC-02': { dimension: 'accuracy', weight: 0.35, label: '占位符扫描' },
   'ACC-03': { dimension: 'accuracy', weight: 0.3, label: '引用可追溯率' },
-  'TEC-01': { dimension: 'technical_quality', weight: 0.3, label: '结构完整性' },
-  'TEC-02': { dimension: 'technical_quality', weight: 0.5, label: '评委 rubric' },
-  'TEC-03': { dimension: 'technical_quality', weight: 0.2, label: '重复度' },
-  'MAT-01': { dimension: 'material_match', weight: 0.7, label: '资质/业绩命中' },
-  'MAT-02': { dimension: 'material_match', weight: 0.3, label: '证书有效期' },
+  'TEC-01': { dimension: 'technical_quality', weight: 0.2, label: '结构完整性' },
+  'TEC-02': { dimension: 'technical_quality', weight: 0.3, label: '评委 rubric' },
+  'TEC-03': { dimension: 'technical_quality', weight: 0.1, label: '重复度' },
+  'TEC-04': { dimension: 'technical_quality', weight: 0.15, label: '空话率' },
+  'TEC-05': { dimension: 'technical_quality', weight: 0.15, label: '招标原文复制率' },
+  'TEC-06': { dimension: 'technical_quality', weight: 0.1, label: '章节深度' },
+  'MAT-01': { dimension: 'material_match', weight: 0.6, label: '资质/业绩命中' },
+  'MAT-02': { dimension: 'material_match', weight: 0.2, label: '证书有效期' },
+  'MAT-03': { dimension: 'material_match', weight: 0.2, label: '知识库引用占比' },
   'DOC-01': { dimension: 'documentation', weight: 0.3, label: '编号与层级规范' },
   'DOC-02': { dimension: 'documentation', weight: 0.3, label: '导出必填完整' },
   'DOC-03': { dimension: 'documentation', weight: 0.4, label: '章节篇幅达标' },
@@ -128,6 +132,13 @@ function finding(rule, score, message, evidence = [], extra = {}) {
     severity: score >= 100 ? 'info' : score >= 70 ? 'warn' : 'blocking',
     message, evidence, ...extra,
   };
+}
+
+/** 新增的内容质量规则：只作提示，不参与"阻塞即封顶"的判定（避免误伤结构稿） */
+function advisory(rule, score, message, evidence = [], extra = {}) {
+  const item = finding(rule, score, message, evidence, extra);
+  item.severity = 'warn';
+  return item;
 }
 
 function skip(rule, reason) {
@@ -179,9 +190,11 @@ export function runRules({ project, artifacts, config }) {
   // ACC-01 事实一致性
   if (content && project) {
     const text = content.markdown || '';
+    // 项目名可能带「项目编号：」前缀（从招标文件解析时带出来的），比对前先剥掉再取前 8 字
+    const cleanName = String(project.name || '').replace(/^项目编号[:：]\s*/, '').trim();
     const facts = [
       { key: '投标人名称', value: project.bidder_name, ok: text.includes(project.bidder_name || '') },
-      { key: '项目名称', value: project.name, ok: text.includes(String(project.name).slice(0, 8)) },
+      { key: '项目名称', value: project.name, ok: text.includes(cleanName.slice(0, 8)) || text.includes(String(project.name).slice(0, 8)) },
       { key: '采购编号', value: analysis?.project?.code, ok: !analysis?.project?.code || text.includes(analysis.project.code) },
       { key: '服务期限', value: analysis?.project?.duration, ok: !analysis?.project?.duration || text.includes('12 个月') || text.includes(analysis.project.duration) },
     ];
@@ -267,6 +280,67 @@ export function runRules({ project, artifacts, config }) {
       { target_agents: score < 80 ? ['tech'] : [] }));
   } else findings.push(skip('TEC-03', '尚未执行查重'));
 
+  // TEC-04 空话率：套话句占全部句子的比例（阈值 15%）
+  const BOILERPLATE = [
+    /从组织、流程、工具三个层面/,
+    /计划—执行—检查—改进/,
+    /可落地、可度量、可追溯/,
+    /本次建设的组成部分/,
+    /明确责任人、(实施步骤|交付物)与验收口径/,
+    /关键动作留痕/,
+    /避免出现职责空转/,
+    /确保招标要求逐条落地/,
+  ];
+  if (content) {
+    const sentences = String(content.markdown || '').split(/[。！？\n]+/).map((s) => s.trim()).filter((s) => s.length >= 8);
+    const hollow = sentences.filter((sentence) => BOILERPLATE.some((re) => re.test(sentence)));
+    const ratio = sentences.length ? hollow.length / sentences.length : 0;
+    const score = ratio <= 0.15 ? 100 : Math.max(0, 100 - (ratio - 0.15) * 300);
+    findings.push(advisory('TEC-04', score,
+      `空话率 ${(ratio * 100).toFixed(1)}%（阈值 15%，${hollow.length}/${sentences.length} 句为套话）`,
+      hollow.slice(0, 5).map((sentence) => ({ type: 'sentence', ref: '套话句', excerpt: clip(sentence, 60) })),
+      { target_agents: score < 80 ? ['tech'] : [] }));
+  } else findings.push(skip('TEC-04', '缺少正文产物'));
+
+  // TEC-05 招标原文复制率：只看方案性正文，响应表/偏离表引用招标原文属于正常做法
+  if (content && project?.tender_text) {
+    const prose = (content.sections || [])
+      .filter((section) => !/响应表|偏离表/.test(section.title))
+      .map((section) => String(section.content || ''))
+      .join('\n')
+      .split(/\r?\n/)
+      .filter((line) => !line.includes('|'))
+      .join('\n')
+      .replace(/\s+/g, '');
+    const tenderText = String(project.tender_text).replace(/\s+/g, '');
+    const contentText = prose || String(content.markdown || '').replace(/\s+/g, '');
+    const SHINGLE = 24;
+    const source = new Set();
+    for (let i = 0; i + SHINGLE <= tenderText.length; i += 1) source.add(tenderText.slice(i, i + SHINGLE));
+    let hit = 0;
+    for (let i = 0; i + SHINGLE <= contentText.length; i += 1) if (source.has(contentText.slice(i, i + SHINGLE))) hit += 1;
+    const copied = contentText.length ? hit / Math.max(1, contentText.length - SHINGLE + 1) : 0;
+    const score = copied <= 0.01 ? 100 : Math.max(0, 100 - copied * 1500);
+    findings.push(advisory('TEC-05', score,
+      `招标原文复制率 ${(copied * 100).toFixed(2)}%（方案正文中 ${hit} 处 ≥${SHINGLE} 字与招标原文重合）`,
+      [],
+      { target_agents: score < 80 ? ['tech'] : [] }));
+  } else findings.push(skip('TEC-05', '缺少正文或招标原文'));
+
+  // TEC-06 章节深度：每章实际字数 / 目标字数
+  if (content && outline) {
+    const targets = new Map((outline.sections || []).map((s) => [s.title, Number(s.target_words || 0)]));
+    const rows = (content.sections || []).map((s) => ({
+      title: s.title, words: s.words, target: targets.get(s.title) || 400,
+    })).filter((row) => !/响应表/.test(row.title));
+    const ratio = rows.length ? rows.reduce((sum, row) => sum + Math.min(1, row.words / Math.max(1, row.target)), 0) / rows.length : 0;
+    const shallow = rows.filter((row) => row.words < row.target * 0.6);
+    findings.push(advisory('TEC-06', ratio * 100,
+      `章节深度 ${(ratio * 100).toFixed(0)}%（${rows.length - shallow.length}/${rows.length} 章达到目标字数 60%）`,
+      shallow.slice(0, 6).map((row) => ({ type: 'section', ref: row.title, excerpt: `${row.words}/${row.target} 字` })),
+      { target_agents: ratio < 0.8 ? ['tech'] : [] }));
+  } else findings.push(skip('TEC-06', '缺少目录或正文'));
+
   // MAT-01 资质命中
   if (knowledge) {
     const hits = knowledge.hits || [];
@@ -290,6 +364,20 @@ export function runRules({ project, artifacts, config }) {
       expiring.length ? `${expiring.length} 张证书将在 ${warnDays} 天内到期` : '暂无临期证书',
       expiring.map((d) => ({ type: 'certificate', ref: d.id, excerpt: `${d.title} 到期 ${d.expires_at}` }))));
   }
+
+  // MAT-03 知识库引用占比：技术方案正文里“引证”字样占全文字数（阈值 10%）
+  if (content) {
+    const text = String(content.markdown || '');
+    const quoted = [...text.matchAll(/[（(](?:依据|证明材料见|相关证明材料见)[：:][^）)]{2,80}[）)]/g)].map((m) => m[0]);
+    const quotedChars = quoted.join('').length;
+    const total = text.replace(/\s+/g, '').length || 1;
+    const ratio = quotedChars / total;
+    const score = ratio <= 0.1 ? 100 : Math.max(0, 100 - (ratio - 0.1) * 400);
+    findings.push(advisory('MAT-03', score,
+      `知识库引用占比 ${(ratio * 100).toFixed(1)}%（阈值 10%，${quoted.length} 处引证）`,
+      quoted.slice(0, 4).map((item) => ({ type: 'reference', ref: '引证', excerpt: clip(item, 60) })),
+      { target_agents: score < 80 ? ['tech'] : [] }));
+  } else findings.push(skip('MAT-03', '缺少正文产物'));
 
   // DOC-01 编号连续
   if (outline) {

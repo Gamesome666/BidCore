@@ -1,8 +1,10 @@
 // 知识库领域（对标 yibiao 四库：方案模板 / 工具资产 / 公司资质 / 人员资质）。
 // 表沿用 knowledge_docs（Lead 已在 db.mjs 里加了 library / file_name / meta_json 三列），
 // 这里只做"库过滤 + 到期聚合 + 目录引用"三件事，CRUD 语义与原仓库一致（共享库，无 userId）。
-import { all, get, run, jparse, jstr } from '../db.mjs';
-import { id, nowIso } from '../lib/util.mjs';
+import fs from 'node:fs';
+import path from 'node:path';
+import { all, get, run, jparse, jstr, VAR_DIR } from '../db.mjs';
+import { id, nowIso, clip } from '../lib/util.mjs';
 
 export const LIBRARIES = [
   { key: 'doc', label: '方案模板库', note: '技术方案模板、章节素材与可复用写法' },
@@ -30,12 +32,18 @@ export function normalizeLibrary(library, category) {
 
 function decorate(row) {
   if (!row) return null;
+  const parsed = jparse(row.meta_json, {});
+  const meta = parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {};
   return {
     ...row,
     library: row.library || inferLibrary(row.category),
     file_name: row.file_name || '',
     meta_json: row.meta_json || '{}',
-    meta: jparse(row.meta_json, {}),
+    meta,
+    // 列表页用的附加字段（原有 content 保留，避免破坏既有消费方）
+    content_excerpt: clip(String(row.content || ''), 300),
+    files: Array.isArray(meta.files) ? meta.files : [],
+    parse: meta.parse || null,
     expired: Boolean(row.expires_at) && new Date(row.expires_at).getTime() < Date.now(),
   };
 }
@@ -67,7 +75,8 @@ export function getKnowledge(docId) {
 }
 
 export function createKnowledge(body = {}) {
-  const docId = id('kdoc');
+  // 上传路由需要先按 docId 落盘附件再入库，因此允许显式传入 id；普通创建仍自动生成
+  const docId = String(body.id || '').trim() || id('kdoc');
   const category = String(body.category || 'case');
   run(
     'INSERT INTO knowledge_docs (id, title, folder, category, content, tags, expires_at, created_at, library, file_name, meta_json) VALUES (?,?,?,?,?,?,?,?,?,?,?)',
@@ -90,6 +99,13 @@ export function updateKnowledge(docId, body = {}) {
   const doc = get('SELECT * FROM knowledge_docs WHERE id=?', docId);
   if (!doc) return null;
   const category = body.category ?? doc.category;
+  // 只改标题/正文时不得清空 meta_json：附件清单和解析状态都在里面
+  const incomingMeta = body.meta !== undefined
+    ? body.meta
+    : body.meta_json !== undefined ? jparse(body.meta_json, {}) : undefined;
+  const metaJson = incomingMeta === undefined || incomingMeta === null
+    ? (doc.meta_json || '{}')
+    : jstr(incomingMeta);
   run(
     'UPDATE knowledge_docs SET title=?, folder=?, category=?, content=?, tags=?, expires_at=?, library=?, file_name=?, meta_json=? WHERE id=?',
     body.title ?? doc.title,
@@ -100,7 +116,7 @@ export function updateKnowledge(docId, body = {}) {
     body.expiresAt ?? body.expires_at ?? doc.expires_at,
     normalizeLibrary(body.library ?? doc.library, category),
     body.fileName ?? body.file_name ?? doc.file_name,
-    jstr(body.meta ?? jparse(body.meta_json, {})) === 'null' ? (doc.meta_json || '{}') : jstr(body.meta ?? jparse(body.meta_json, {})),
+    metaJson,
     docId,
   );
   return getKnowledge(docId);
@@ -110,6 +126,12 @@ export function deleteKnowledge(docId) {
   const doc = get('SELECT id FROM knowledge_docs WHERE id=?', docId);
   if (!doc) return false;
   run('DELETE FROM knowledge_docs WHERE id=?', docId);
+  // 附件是素材的从属资产：删素材必须连带删 var/files/knowledge/<docId>，否则磁盘只增不减
+  const root = path.resolve(VAR_DIR, 'files', 'knowledge');
+  const dir = path.resolve(root, String(doc.id));
+  if (dir.startsWith(`${root}${path.sep}`)) {
+    try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* 删除失败不阻断素材删除 */ }
+  }
   return true;
 }
 

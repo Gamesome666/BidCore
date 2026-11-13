@@ -594,3 +594,67 @@ code, pre { font-family: var(--mono); font-size: 12.5px; }
   .step + .step { border-left: 0; border-top: 1px solid var(--line); }
   .artifact-doc { padding: 18px; }
 }
+
+/* ------------------------------------------------------- 知识库：上传/预览 */
+.kb-card { position: relative; }
+.kb-thumb-wrap { border: 1px solid var(--line); border-radius: 8px; overflow: hidden; background: var(--card-2); height: 96px; }
+.kb-thumb { width: 100%; height: 100%; object-fit: cover; display: block; }
+.kb-file-badge { color: var(--accent); background: var(--accent-soft); border-color: transparent; }
+.kb-files-row { display: flex; flex-wrap: wrap; align-items: center; gap: 4px; }
+.kb-file-chip {
+  max-width: 100%; height: 22px; padding: 0 8px; border-radius: 999px;
+  border: 1px solid var(--line); background: var(--card-2);
+  font-size: 10.6px; color: var(--ink-3); line-height: 20px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.kb-file-chip:hover { border-color: var(--accent); color: var(--accent); }
+.kb-parse-note { color: var(--muted); line-height: 1.5; }
+
+.kb-upload-drop {
+  margin-top: 14px; padding: 22px 16px; border: 1.5px dashed var(--line-strong);
+  border-radius: 10px; background: var(--card-2); text-align: center;
+  color: var(--ink-3); font-size: 12.5px; transition: border-color .15s ease, background .15s ease;
+}
+.kb-upload-drop.active { border-color: var(--accent); background: var(--accent-soft); color: var(--accent); }
+
+.kb-filelist { display: flex; flex-direction: column; gap: 5px; margin-top: 10px; max-height: 220px; overflow-y: auto; }
+.kb-file-row {
+  display: flex; align-items: center; gap: 8px; padding: 6px 9px;
+  border: 1px solid var(--line); border-radius: 7px; background: var(--card);
+  font-size: 11.8px; color: var(--ink-3);
+}
+.kb-file-row .kb-file-mark { flex: 0 0 auto; font-size: 13px; }
+.kb-file-row .fname { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--ink-2); }
+.kb-file-row .hint { flex: 0 0 auto; white-space: nowrap; }
+
+.kb-drop-overlay {
+  position: fixed; inset: 0; z-index: 60; display: none; place-items: center;
+  padding: 24px; background: rgba(16, 24, 32, .38); backdrop-filter: blur(2px);
+  color: #fff; font-size: 15px; letter-spacing: .02em; pointer-events: none;
+}
+.kb-drop-overlay.active { display: grid; }
+.kb-drop-overlay > div {
+  border: 2px dashed rgba(255, 255, 255, .75); border-radius: 16px;
+  padding: 42px 68px; background: rgba(16, 24, 32, .5);
+}
+
+.kb-preview-img {
+  display: block; margin: 0 auto; max-width: 100%; max-height: min(58vh, 520px);
+  border: 1px solid var(--line); border-radius: 8px; background: var(--card-2);
+}
+.kb-preview-frame {
+  display: block; width: 100%; height: min(58vh, 520px);
+  border: 1px solid var(--line); border-radius: 8px; background: #fff;
+}
+.kb-preview-text {
+  margin: 0; padding: 10px 12px; max-height: 220px; overflow: auto;
+  border: 1px solid var(--line); border-radius: 8px; background: var(--card-2);
+  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+  font-size: 11.5px; line-height: 1.65; white-space: pre-wrap; word-break: break-word; color: var(--ink-3);
+}
+
+@media (max-width: 720px) {
+  .kb-preview-frame { height: 44vh; }
+  .kb-preview-img { max-height: 44vh; }
+  .kb-file-row .hint { display: none; }
+}

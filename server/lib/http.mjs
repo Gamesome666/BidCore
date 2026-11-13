@@ -32,6 +32,49 @@ export function readBody(req, limit = 8 * 1024 * 1024) {
   });
 }
 
+/**
+ * 读取原始请求体（multipart 上传用）。与 readBody 的区别：
+ *  · 返回 Buffer，不做 JSON 解析（文件二进制不能当字符串处理）；
+ *  · 超限时立刻停止收集并抛 code=FILE_TOO_LARGE，由路由回 413 后再销毁连接。
+ */
+export function readRawBody(req, limit = 60 * 1024 * 1024) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    let size = 0;
+    let settled = false;
+
+    function cleanup() {
+      req.removeListener('data', onData);
+      req.removeListener('end', onEnd);
+      req.removeListener('error', onError);
+    }
+    function finish(fn, value) {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      fn(value);
+    }
+    function onData(chunk) {
+      size += chunk.length;
+      if (size > limit) {
+        const error = new Error(`请求体超过 ${Math.round(limit / 1024 / 1024)}MB 上限`);
+        error.code = 'FILE_TOO_LARGE';
+        // 先暂停读取，路由写完 413 再 destroy；直接 destroy 会把响应一并掐断
+        finish(reject, error);
+        req.pause();
+        return;
+      }
+      chunks.push(chunk);
+    }
+    function onEnd() { finish(resolve, Buffer.concat(chunks)); }
+    function onError(error) { finish(reject, error); }
+
+    req.on('data', onData);
+    req.on('end', onEnd);
+    req.on('error', onError);
+  });
+}
+
 export function createRouter() {
   const routes = [];
   function add(method, pattern, handler, opts = {}) {

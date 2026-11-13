@@ -1,10 +1,13 @@
-﻿// Supervisor：计划器（LLM 可选）+ 确定性校验 + FallbackPlan + 返工规则。
+// Supervisor：计划器（LLM 可选）+ 确定性校验 + FallbackPlan + 返工规则。
 // 关键约束：Supervisor 只产出计划，不写内容；校验失败一律兜底，绝不中断运行。
-import { FALLBACK_PLAN } from '../seed.mjs';
+import { FALLBACK_PLAN, loadSettings } from '../seed.mjs';
 import { generateJson, llmStatus } from './llm.mjs';
 import { clip } from '../lib/util.mjs';
 
-const AGENT_KEYS = ['parse-tender', 'bid-strategy', 'knowledge', 'tech', 'commercial', 'compliance', 'quality', 'doc', 'supervisor'];
+const AGENT_KEYS = [
+  'parse-tender', 'knowledge', 'format', 'doc-plan', 'bid-strategy', 'tech', 'commercial', 'compliance', 'doc', 'doc-preview', 'quality', 'supervisor',
+  'qualification-review', 'technical-review', 'material-review', 'other-review', 'legal', 'consistency', 'summary',
+];
 const NODE_TYPES = ['agent', 'quality', 'human-review', 'export'];
 
 export class PlanInvalid extends Error {}
@@ -111,7 +114,16 @@ function normalizeCandidate(raw) {
 export async function planRun({ run, project, analysisHint }) {
   const fallback = structuredClone(FALLBACK_PLAN);
   fallback.objective = run.objective;
-  fallback.rationale = `基于项目「${project.name}」的确定性计划：覆盖解析/检索/策略/技术/商务/合规/质量/双人工门禁/导出。`;
+  fallback.rationale = `基于项目「${project.name}」的确定性计划：解析 → 检索 → 格式提取 → 编制计划 → 要求确认 → 四类审查 → 法规 → 技术/商务 → 一致性 → 质检 → 预览 → 终审 → 汇总 → 导出。`;
+
+  // 默认不让模型改流程：模型给的 DAG 常绕开「格式提取/编制计划/预览/终审」，
+  // 导致闸门看到的是解析 JSON 而不是编制计划。只有显式开启 workflow.llm_plan 才允许自定义。
+  const workflowCfg = loadSettings().workflow || {};
+  if (workflowCfg.llm_plan !== true) {
+    const plan = validatePlan(fallback);
+    plan.source = 'fallback';
+    return { plan, source: 'fallback', reason: '使用内置十步流程（未开启模型自定义编排）' };
+  }
 
   const llmPlan = await generateJson({
     system: [
@@ -133,8 +145,14 @@ export async function planRun({ run, project, analysisHint }) {
 
   const status = llmStatus();
   const llmUsable = status.mode === 'openai' && status.ready;
+  // 模型自定义编排也必须保留关键节点，否则退回内置流程
+  const REQUIRED = ['parse-tender', 'format-extract', 'doc-plan', 'requirements-confirm', 'final-approval', 'export'];
   try {
-    const plan = validatePlan(normalizeCandidate(llmPlan));
+    const candidate = normalizeCandidate(llmPlan);
+    const keys = new Set((candidate.nodes || []).map((node) => node.node_key));
+    const missing = REQUIRED.filter((key) => !keys.has(key));
+    if (missing.length) throw new PlanInvalid(`模型计划缺少关键节点：${missing.join('、')}`);
+    const plan = validatePlan(candidate);
     // mock 模式下 generateJson 原样返回兜底对象：不能标成 LLM 规划
     const usedLlm = llmUsable && llmPlan !== fallback;
     plan.source = usedLlm ? 'llm' : 'fallback';
@@ -144,7 +162,7 @@ export async function planRun({ run, project, analysisHint }) {
   } catch (error) {
     const plan = validatePlan(fallback);
     plan.source = 'fallback';
-    return { plan, source: 'fallback', reason: String(error.message) };
+    return { plan, source: 'fallback', reason: `模型计划不可用，已回退内置流程：${String(error.message)}` };
   }
 }
 

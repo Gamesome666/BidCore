@@ -146,6 +146,8 @@ async function startRun({ dryRun = false, objective } = {}) {
     dryRun,
   });
   toast('工作流已启动', `运行 ${res.run_id.slice(0, 12)}`, 'ok');
+  // 记住“这次是我刚启动的”：到达人工闸门时自动把人送到审核页，省一次点击
+  try { sessionStorage.setItem('bidcore.autoReview', res.run_id); } catch { /* 隐私模式下忽略 */ }
   location.hash = `#/run/${res.run_id}`;
   return res;
 }

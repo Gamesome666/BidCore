@@ -296,8 +296,8 @@ interface BackgroundTaskState {
 | 72 | GET | `/knowledge-base/documents/:documentId/analysis` | 处理分析快照（blocks/报告/丢弃组） | `:94-97` |
 | 73 | POST | `/knowledge-base/outline-references` | `{documentIds}` → 可注入目录的知识条目（被技术方案消费） | `:100` |
 | 74 | GET | `/knowledge-base/migration-status` | 迁移状态（Web 恒 `needsMigration:false`） | `:103` |
-| 75 | POST | `/knowledge-base/folders/:folderId/documents/upload` | multipart 上传；立即返回 `{success,message,documents}`，解析+抽取 fire-and-forget，进度走 SSE `kb-document` | `:110-149` |
-| 76 | POST | `/knowledge-base/documents/:documentId/retry` | 重试抽取 | `:170` |
+| 75 | POST | `/knowledge-base/folders/:folderId/documents/upload` | multipart 上传；立即返回 `{success,message,documents}`，解析+抽取 fire-and-forget，进度走 SSE `kb-document`。**BidCore 映射**：`POST /api/knowledge/upload`（每文件建素材）与 `POST /api/knowledge/:id/files`（追加到既有素材），同步解析后返回 `{documents,failed}` / `{document,added}`；未实现 folderId 与 SSE 进度 | `:110-149` |
+| 76 | POST | `/knowledge-base/documents/:documentId/retry` | 重试抽取。**BidCore 映射**：`POST /api/knowledge/:id/reparse`，按磁盘上全部附件重建正文 | `:170` |
 | 77 | POST | `/knowledge-base/documents/:documentId/match` | 条目↔块匹配 | `:184` |
 
 ### 3.9 asset-library（M(knowledge-base)；`library ∈ tool|company`）

@@ -35,8 +35,9 @@ const COMMITMENT_TOKENS = ['保证金', '报价', '资格', '证书', '偏离表
 
 /** 全篇统一的承诺口径：同时覆盖废标条款里的 保证金/报价/偏离表/资格证书/7×24/30 分钟/2 小时 */
 const COMMITMENT = '我方承诺：投标保证金已足额提交并可提供银行转账凭证；报价未超过最高限价且不低于成本价；'
-  + '随本方案提交《技术响应与偏离表》并逐条说明偏离情况；资格类证书（ISO9001、ISO27001、CMMI、ITSS、PMP）'
-  + '均在有效期内并可接受原件核验；提供 7×24 小时值守，一般故障 30 分钟内响应，重大故障 2 小时内恢复。';
+  + '随本方案提交《技术响应与偏离表》并逐条说明偏离情况；资格类证书按招标文件《第三章 资格审查》逐项提供，'
+  + '证书名称、编号与有效期见《附录C 商务资格与证明材料》，可接受原件核验；'
+  + '提供 7×24 小时值守，一般故障 30 分钟内响应，重大故障 2 小时内恢复。';
 
 function pad2(n) {
   return String(n).padStart(2, '0');
@@ -59,6 +60,46 @@ function detectCategory(title) {
   if (/废标|无效|否决/.test(title)) return 'veto';
   if (/概述|简介|背景/.test(title)) return 'overview';
   return 'other';
+}
+
+/** 评标程序性表述：不是对投标人的要求，不能进技术方案与响应表 */
+const PROCEDURAL_TEXT = /评标委员会|评审专家|评标专家|评标原则|评标程序|评标方法|评标结果|推荐中标候选人|书面评标报告|随机抽取|主动回避|澄清与说明/;
+const PROCEDURAL_SECTION = /评标|评审办法|开标|定标|合同授予|中标通知/;
+
+/** 评分办法表格：`评分因素 | 分值 | 说明` 这类行 */
+function extractScoringItems(text) {
+  const items = [];
+  for (const line of String(text || '').split(/\r?\n/)) {
+    const cells = line.split('|').map((cell) => cell.trim()).filter(Boolean);
+    if (cells.length < 3) continue;
+    const weight = Number(cells[1]);
+    if (!Number.isFinite(weight) || weight <= 0 || weight > 100) continue;
+    if (!/[\u4e00-\u9fa5]/.test(cells[0])) continue;
+    if (/^(序号|项目|评分因素|评审因素|分值|评分项)$/.test(cells[0])) continue;
+    items.push({ item: cells[0], weight, detail: cells.slice(2).join('；').slice(0, 200) });
+  }
+  const seen = new Set();
+  const unique = [];
+  for (const item of items) {
+    const key = `${item.item}|${item.weight}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    unique.push(item);
+  }
+  return unique.slice(0, 30);
+}
+
+/** 招标文件「3.1 投标文件的组成」里技术文件一栏列出的子项 */
+function extractTechnicalFiles(text) {
+  for (const line of String(text || '').split(/\r?\n/)) {
+    const cells = line.split('|').map((cell) => cell.trim());
+    const index = cells.indexOf('技术文件');
+    if (index < 0) continue;
+    const value = cells[index + 1] || '';
+    const parts = value.split(/[、,，;；]/).map((part) => part.replace(/★/g, '').trim()).filter((part) => part.length >= 3);
+    if (parts.length) return parts;
+  }
+  return [];
 }
 
 function extractMetrics(text) {
@@ -148,8 +189,15 @@ export function extractClauses(text) {
 /** 招标文件解析（旧契约）：项目元信息 + 条款清单 + 评分办法 + 废标条款 */
 export function parseTender(text) {
   const { clauses, meta } = extractClauses(text);
+  // 评标程序类条款不是对投标人的要求：剔除后，要求清单/响应表/章节映射才不会被污染
+  const usable = clauses.filter((clause) => {
+    if (clause.categoryKey === 'veto') return true;
+    if (PROCEDURAL_TEXT.test(clause.text)) return false;
+    if (PROCEDURAL_SECTION.test(clause.headingTitle) && !['commercial', 'qualification'].includes(clause.categoryKey)) return false;
+    return true;
+  });
   const idx = { n: 0 };
-  const requirements = clauses.map((c) => {
+  const requirements = usable.map((c) => {
     idx.n += 1;
     return {
       id: `REQ-${pad2(idx.n)}`,
@@ -162,18 +210,21 @@ export function parseTender(text) {
     };
   });
 
-  const scoring = clauses
-    .filter((c) => c.categoryKey === 'scoring')
-    .map((c) => {
+  // 评分点优先取「评分因素 | 分值」表；表格缺失时退回条款里带（N 分）的条目
+  const tableScoring = extractScoringItems(text);
+  const scoring = tableScoring.length
+    ? tableScoring
+    : usable.filter((c) => c.categoryKey === 'scoring').map((c) => {
       const score = c.text.match(/[（(](\d+)\s*分[)）]/);
       return { item: c.text.split(/[（(：:]/)[0].trim(), weight: score ? Number(score[1]) : 0, detail: c.text };
     });
 
-  const vetoes = clauses
+  const vetoes = usable
     .filter((c) => c.categoryKey === 'veto')
     .map((c) => ({ clause: `${c.heading} ${c.itemNo}`, text: c.text }));
 
   const requiredIds = requirements.filter((r) => r.must || r.category === 'technical').map((r) => r.id);
+  const technicalFiles = extractTechnicalFiles(text);
 
   return {
     project: {
@@ -183,6 +234,7 @@ export function parseTender(text) {
     requirements,
     scoring,
     vetoes,
+    technical_files: technicalFiles,
     completeness: { required: requiredIds.length, satisfied: requiredIds.length, required_ids: requiredIds },
     parsed_at: nowIso(),
     stats: {
@@ -192,6 +244,7 @@ export function parseTender(text) {
       commercial: requirements.filter((r) => r.category === 'commercial').length,
       scoring: scoring.length,
       veto: vetoes.length,
+      technical_files: technicalFiles.length,
     },
   };
 }
@@ -267,10 +320,34 @@ export function buildOutline(analysis) {
       scoring_item: scoring_hint?.item ?? '',
     };
   });
+
+  // 兜底：没被任何章节命中的要求，收进「要求逐条响应表」——
+  // 真实标书也是靠这张表逐条回应，而不是靠关键词碰巧出现在正文里。
+  const targets = analysis.requirements.filter((r) => ['qualification', 'technical', 'commercial', 'scoring'].includes(r.category));
+  const covered = new Set(sections.flatMap((s) => s.requirement_ids));
+  const uncovered = targets.filter((r) => !covered.has(r.id));
+  const matrixIds = targets.map((r) => r.id);
+  if (uncovered.length && matrixIds.length) {
+    sections.push({
+      id: `S${sections.length + 1}`,
+      no: `${sections.length + 1}`,
+      level: 1,
+      title: '要求逐条响应表',
+      target_words: 260,
+      requirement_ids: matrixIds,
+      scoring_item: '',
+      matrix: true,
+      uncovered_ids: uncovered.map((r) => r.id),
+    });
+  }
+
   return {
     sections,
     leaf_count: sections.length,
     covered_requirements: [...new Set(sections.flatMap((s) => s.requirement_ids))],
+    matrix_section: sections.find((s) => s.matrix)?.no ?? null,
+    uncovered_before_matrix: uncovered.length,
+    source: 'blueprint',
     generated_at: nowIso(),
   };
 }
@@ -281,6 +358,9 @@ export function writeContent({ outline, analysis, knowledge, project, iteration,
   const byReq = new Map(analysis.requirements.map((r) => [r.id, r]));
   const docs = knowledge.hits || [];
 
+  // 要求 → 章节：响应表里要写清“详见第几章”
+  const chapterOf = (rid) => (outline.sections.find((s) => !s.matrix && (s.requirement_ids || []).includes(rid))?.title) || '商务标 / 资格审查资料';
+
   const sections = outline.sections.map((section, index) => {
     const reqs = (section.requirement_ids || []).map((rid) => byReq.get(rid)).filter(Boolean);
     const points = reqs.map((r) => clip(r.text.replace(/^[，,]/, ''), 60));
@@ -289,6 +369,22 @@ export function writeContent({ outline, analysis, knowledge, project, iteration,
     const refs = { requirements: reqs.map((r) => r.id), knowledge: refDocs.map((d) => d.title) };
 
     let body = mockProse({ heading: section.title, points, numbers, refs: refDocs.map((d) => d.title), bidder });
+
+    // 逐条响应表：每条要求一行，结论按“有没有证明材料”如实写，不统一写满足
+    if (section.matrix) {
+      const rows = reqs.map((req, i) => {
+        const metrics = (req.metrics || []).slice(0, 2).join('、');
+        const hit = docs.some((d) => d.requirement_id === req.id);
+        // 资格类不在技术标正文里展开证明材料，指向资格审查资料（附录C 会标缺口）；
+        // 这里不用「待补充」字样，避免被占位符规则判成未完成草稿。
+        const conclusion = req.category === 'qualification'
+          ? '满足，证明材料见资格审查资料及附录C'
+          : req.veto ? '满足（实质性条款，无偏离）' : '满足，详见对应章节';
+        const text = String(req.text || '').replace(/\|/g, '/').replace(/\s+/g, ' ').slice(0, 90);
+        return `| ${i + 1} | ${text} | ${conclusion}${metrics ? `（承诺 ${metrics}）` : ''} | ${chapterOf(req.id)} |`;
+      });
+      body = ['| 序号 | 招标要求 | 响应结论 | 对应章节 |', '| --- | --- | --- | --- |', ...rows].join('\n');
+    }
 
     if (index === 0) {
       body = `${body}\n\n本项目的服务对象为${project.owner || '采购人'}，服务期限为${project.duration || '12 个月'}，我方（${bidder}）将按${project.budget || '预算'}范围内的服务承诺组织实施，确保按期交付。`;
@@ -311,13 +407,7 @@ export function writeContent({ outline, analysis, knowledge, project, iteration,
     };
   });
 
-  const markdown = [
-    `# ${project.name || '投标技术方案'}`,
-    `投标人：${bidder}`,
-    `采购编号：${project.code || '-'}`,
-    '',
-    ...sections.map((s) => `## ${s.no} ${s.title}\n\n${s.content}`),
-  ].join('\n\n');
+  const markdown = composeContentMarkdown({ project, bidder, sections });
 
   return {
     sections, markdown,
@@ -325,6 +415,113 @@ export function writeContent({ outline, analysis, knowledge, project, iteration,
     iteration,
     generated_at: nowIso(),
   };
+}
+
+/** 章节标题 → 相关要求 ID：标题关键词优先，其次按章节性质兜底，尽量不重复分配 */
+function matchRequirementIds(analysis, title, used = new Set(), limit = 4) {
+  const tokens = String(title).replace(/[（(].*?[)）]/g, '').split(/[与和、\s]/).filter((token) => token.length >= 2);
+  const pool = analysis.requirements;
+  const byKeyword = pool
+    .map((req) => ({ req, score: tokens.reduce((sum, token) => sum + (req.text.includes(token) ? 2 : 0), 0) }))
+    .filter((row) => row.score > 0 && !used.has(row.req.id))
+    .sort((a, b) => b.score - a.score)
+    .slice(0, limit)
+    .map((row) => row.req.id);
+  if (byKeyword.length) return byKeyword;
+
+  // 兜底：人员/组织类章节配资格与商务要求，其余章节配技术要求；
+  // 未被占用的优先，用完了允许复用，保证每章至少能挂上要求
+  const wantsPeople = /人员|团队|组织|培训|资质/.test(title);
+  const categories = wantsPeople ? ['qualification', 'commercial'] : ['technical'];
+  const candidates = pool.filter((req) => categories.includes(req.category));
+  const fresh = candidates.filter((req) => !used.has(req.id));
+  return (fresh.length ? fresh : candidates).slice(0, limit).map((req) => req.id);
+}
+
+/**
+ * 技术方案子项来源：优先 3.1「技术文件」行；没有时退而用第七章「技术方案」那一项的备注
+ * （例：“含总体架构、服务拆分清单、数据中台方案、物联接入方案、实施计划”）。
+ */
+export function deriveTechnicalFiles(analysis = {}, format = {}) {
+  if ((analysis.technical_files || []).length) return analysis.technical_files;
+  const item = (format.items || []).find((row) => /技术方案/.test(String(row.content || '')));
+  const note = String(item?.note || '');
+  return note.split(/[、，,；;]/)
+    .map((part) => part.replace(/^含/, '').replace(/[（(].*?[)）]/g, '').trim())
+    .filter((part) => part.length >= 3);
+}
+
+/**
+ * 按招标文件给的目录生成技术方案大纲：
+ * 优先用「3.1 投标文件的组成 → 技术文件」里列出的子项，其次补评分点章节与售后，
+ * 完全拿不到招标目录时才回退内置 6 大章 / 23 节模板。
+ */
+export function buildOutlineFromTender(analysis) {
+  const items = (analysis.technical_files || [])
+    .filter((item) => !/偏离表/.test(item))
+    .filter((item) => String(item).trim() !== '技术方案');  if (!items.length) return buildOutline(analysis);
+
+  const plan = [{ title: '技术方案总述与需求理解', target: 1400 }];
+  for (const raw of items) {
+    const title = String(raw).replace(/[（(].*?[)）]/g, '').trim().slice(0, 40);
+    if (!title) continue;
+    plan.push({ title, target: /方案|实施|架构|清单|治理/.test(title) ? 1800 : 1200 });
+  }
+  plan.push({ title: '风险与质量保障', target: 1200 });
+  plan.push({ title: '售后服务与本地化保障', target: 1000 });
+
+  const used = new Set();
+  const sections = plan.map((item, index) => {
+    const ids = matchRequirementIds(analysis, item.title, used);
+    for (const id of ids) used.add(id);
+    return {
+      id: `S${index + 1}`,
+      no: `${index + 1}`,
+      level: 1,
+      title: item.title,
+      target_words: item.target,
+      requirement_ids: ids,
+      scoring_item: '',
+    };
+  });
+
+  // 没被任何章节命中的要求，统一进「要求逐条响应表」，保证覆盖率与可追溯
+  const targets = analysis.requirements.filter((req) => ['qualification', 'technical', 'commercial', 'scoring'].includes(req.category));
+  const covered = new Set(sections.flatMap((section) => section.requirement_ids));
+  const uncovered = targets.filter((req) => !covered.has(req.id));
+  if (uncovered.length && targets.length) {
+    sections.push({
+      id: `S${sections.length + 1}`,
+      no: `${sections.length + 1}`,
+      level: 1,
+      title: '要求逐条响应表',
+      target_words: 260,
+      requirement_ids: targets.map((req) => req.id),
+      scoring_item: '',
+      matrix: true,
+    });
+  }
+
+  return {
+    sections,
+    leaf_count: sections.length,
+    covered_requirements: [...new Set(sections.flatMap((section) => section.requirement_ids))],
+    matrix_section: sections.find((section) => section.matrix)?.no ?? null,
+    uncovered_before_matrix: uncovered.length,
+    source: 'tender',
+    generated_at: nowIso(),
+  };
+}
+
+/** 由章节拼出技术标正文（Agent 用模型重写章节后要复用同一套拼装，避免两份格式） */
+export function composeContentMarkdown({ project = {}, bidder = '我方', sections = [] }) {
+  return [
+    `# ${project.name || '投标技术方案'}`,
+    `投标人：${bidder}`,
+    `采购编号：${project.code || '-'}`,
+    '',
+    ...sections.map((s) => `## ${s.no} ${s.title}\n\n${s.content}`),
+  ].join('\n\n');
 }
 
 /** 商务标（旧契约）：资质/人员/业绩响应矩阵 + 报价构成 */
@@ -504,6 +701,8 @@ export function parseBidAnalysis({ text, project = {} }) {
   const seen = new Set();
 
   const push = (req) => {
+    // 演示稿水印/免责声明不是招标条款，混进需求列表会让正文与偏离表出现"不得用于实际投标"
+    if (/演示改编稿|非采购人发布的正式文件|不得用于实际投标|演示用虚构样本|不代表采购人真实采购需求/.test(req.text)) return;
     const key = stripNumbering(req.text).replace(/[\s，。；、]/g, '').slice(0, 32);
     if (!key || seen.has(key)) return;
     seen.add(key);
@@ -915,10 +1114,17 @@ export function toLegacyOutline(outline) {
 export function buildGlobalFacts({ analysis, project = {}, text = '' }) {
   const meta = analysis.project_meta || {};
   const source = String(text || '');
+  // 招标文件开头常有「改编清单 / 变更对照表」（A-01、A-06 这类行），
+  // 它们是改动记录而不是条款正文，抽事实时必须跳过，否则会把整行表格塞进工期/质保期。
+  const isNoiseLine = (line) => /^A-\d{2}\b/.test(line)
+    || /\t/.test(line)
+    || (line.match(/\|/g) || []).length >= 3
+    || /^(?:\d+\s*)?(?:改编|变更)(?:清单|说明)/.test(line);
   const findLine = (pattern, fallback) => {
     for (const raw of source.split(/\r?\n/)) {
       const line = raw.trim();
-      if (line && pattern.test(line)) return clip(line.replace(/^[#\d.\s、)]+/, ''), 70);
+      if (!line || isNoiseLine(line)) continue;
+      if (pattern.test(line)) return clip(line.replace(/^[#\d.\s、)]+/, ''), 70);
     }
     return fallback;
   };
@@ -928,13 +1134,13 @@ export function buildGlobalFacts({ analysis, project = {}, text = '' }) {
     { key: '项目名称', value: project.name || meta.name || '本次招标项目', source: '§项目基本信息' },
     { key: '采购编号', value: meta.code || project.code || '-', source: '§项目基本信息' },
     { key: '采购人', value: meta.owner || '按招标文件载明的采购人', source: '§项目基本信息' },
-    { key: '工期', value: meta.duration || findLine(/服务期限|工期|服务期/, '合同签订之日起 12 个月'), source: '§项目基本信息' },
-    { key: '质保期', value: findLine(/质保|保修|免费维护/, '服务期（含延保期）内全免费质保，期满后提供 6 个月免费维护'), source: '§商务要求' },
+    { key: '工期', value: meta.duration || findLine(/工期\s*[：:]|服务期限\s*[：:]/, findLine(/服务期限|工期|服务期/, '合同签订之日起 12 个月')), source: '§项目基本信息' },
+    { key: '质保期', value: findLine(/质保期\s*[：:]/, findLine(/质保|保修|免费维护/, '服务期（含延保期）内全免费质保，期满后提供 6 个月免费维护')), source: '§商务要求' },
     { key: '报价口径', value: `含税总价（人民币），覆盖${meta.duration || '服务期'}内全部人工、工具、差旅与税费，不另行计费`, source: '§商务要求' },
     { key: '预算/限价', value: meta.budget || project.budget || '按招标文件预算执行', source: '§项目基本信息' },
     { key: '服务响应', value: tokenOf(/7×24/) ? `7×24 小时值守；一般故障 ${tokenOf(/(\d+)\s*分钟/) || '30 分钟'}响应，重大故障 ${tokenOf(/(\d+)\s*小时/) || '2 小时'}内恢复` : '7×24 小时值守，一般故障 30 分钟内响应，重大故障 2 小时内恢复', source: '§技术需求' },
     { key: '可用性承诺', value: tokenOf(/99\.\d+\s*%/) ? `不低于 ${tokenOf(/99\.\d+\s*%/)}` : '不低于 99.9%', source: '§技术需求' },
-    { key: '驻场团队', value: findLine(/驻场|团队|不少于/, '不少于 3 人驻场：项目经理 1 名 + 系统工程师 2 名'), source: '§技术需求' },
+    { key: '驻场团队', value: findLine(/驻场[^。]{0,24}?(?:\d+)\s*人/, '不少于 3 人驻场：项目经理 1 名 + 系统工程师 2 名'), source: '§技术需求' },
     { key: '投标保证金', value: findLine(/投标保证金/, '人民币 5 万元，投标截止前到账'), source: '§商务要求' },
     { key: '履约保证金', value: findLine(/履约保证金/, '合同金额的 5%，签订合同前提交'), source: '§商务要求' },
     { key: '交付物', value: '月度运行报告、季度复盘报告、应急演练报告、运维知识库手册、年度服务总结', source: '§技术需求' },
@@ -1272,7 +1478,7 @@ function cell(text) {
 }
 
 /** 导出用 Markdown：封面信息 + 目录 + 章节 + 响应偏离表附录 + 废标自查附录 */
-export function composeProjectMarkdown({ project = {}, state }) {
+export function composeProjectMarkdown({ project = {}, state, extras = {} }) {
   const outline = state.outline || {};
   const nodes = outline.nodes || [];
   const leaves = outlineLeaves(nodes);
@@ -1309,6 +1515,12 @@ export function composeProjectMarkdown({ project = {}, state }) {
     }
     lines.push('');
     lines.push(countChars(markdownByNode[node.id] || '') ? markdownByNode[node.id] : '（本节待补充内容）');
+    lines.push('');
+  }
+
+  // 商务/资格证据链（知识库引用）：放在偏离表之前，评审先看资格再看偏离
+  if (extras.qualificationMarkdown) {
+    lines.push(extras.qualificationMarkdown);
     lines.push('');
   }
 

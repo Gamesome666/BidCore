@@ -167,8 +167,11 @@ export default {
             <select class="select" id="set-remind" ${disabled}>
               ${[0.5, 0.75, 0.9].map((v) => `<option value="${v}" ${num(cfg.remindRatio, 0.75) === v ? 'selected' : ''}>${Math.round(v * 100)}% 时限处提醒</option>`).join('')}
             </select></div>
-          <div class="field"><label>时限策略</label>
-            <div class="hint" style="height:34px;display:flex;align-items:center">默认三级：项目负责人 → 商务负责人 → 管理员（240/240/480 分钟）</div></div>
+          <div class="field"><label>终审会签级数</label>
+            <select class="select" id="set-levels" ${disabled}>
+              ${[1, 2, 3].map((v) => `<option value="${v}" ${num(cfg.approvalLevels, 3) === v ? 'selected' : ''}>${v} 级${v === 1 ? '（自己确认，一个人也能跑完）' : v === 2 ? '（编制人 → 领导）' : '（项目负责人 → 商务 → 管理员）'}</option>`).join('')}
+            </select>
+            <div class="hint fs11">只影响 final-approval 这类「default」策略的闸门；「要求确认」始终 1 级。</div></div>
         </div>
         <label class="row" style="gap:8px;align-items:flex-start">
           <button class="switch" role="switch" id="set-autopass" aria-checked="${auto ? 'true' : 'false'}" ${disabled}></button>
@@ -203,6 +206,11 @@ export default {
             <label class="row" style="gap:8px;height:34px">
               <button class="switch" role="switch" id="set-wf-enabled" aria-checked="${cfg.enabled === false ? 'false' : 'true'}" ${disabled}></button>
               <span class="hint fs12">关闭后不再自动 tick（适合备份/迁移）</span></label></div>
+          <div class="field"><label>模型自定义编排</label>
+            <label class="row" style="gap:8px;height:34px">
+              <button class="switch" role="switch" id="set-llm-plan" aria-checked="${cfg.llm_plan === true ? 'true' : 'false'}" ${disabled}></button>
+              <span class="hint fs12">关闭时固定用内置十步流程（推荐）</span></label>
+            <div class="hint">开启后 Supervisor 会让模型设计节点，缺关键节点会自动回退。</div></div>
         </div>
         <div class="flex-between mt8">
           <div class="hint fs11">单实例部署：进程内定时器 + SQLite 租约，无需外部队列。</div>
@@ -254,6 +262,7 @@ export default {
         'set-two-pass': () => Boolean(quality().judge?.two_pass),
         'set-autopass': () => review().allowAutoPass === true,
         'set-wf-enabled': () => workflow().enabled !== false,
+        'set-llm-plan': () => workflow().llm_plan === true,
       };
       for (const [id, getter] of Object.entries(toggles)) {
         const button = $(`#${id}`, root);
@@ -309,6 +318,15 @@ export default {
           state.loading = false;
           toast('模型配置已保存', body.mode === 'openai' ? `${body.model} @ ${body.base_url || '-'}` : 'mock 模式', 'ok');
           paint();
+          // 保存后立刻探活：模型名不被服务端接受时当场报错，避免“以为接上了、正文却回退模板”
+          if (body.mode === 'openai') {
+            try {
+              const probe = await api.llmProbe();
+              if (probe && probe.ok === false) {
+                toast('模型不可用', String(probe.error || '').slice(0, 160), 'bad');
+              }
+            } catch { /* 探活失败不影响保存 */ }
+          }
         } catch (error) {
           button.disabled = false;
           toast('保存失败', `${error.code || ''} ${error.message || ''}`.trim(), 'bad');
@@ -355,13 +373,14 @@ export default {
         const body = {
           ...review(),
           remindRatio: num($('#set-remind', root).value, 0.75),
+          approvalLevels: num($('#set-levels', root).value, 3),
           allowAutoPass: $('#set-autopass', root).getAttribute('aria-checked') === 'true',
         };
         button.disabled = true;
         try {
           await api.saveSettings({ review: body });
           state.settings = { ...state.settings, review: body };
-          toast('审核策略已保存', body.allowAutoPass ? '已开启超时自动通过（请注意风险）' : '超时不自动通过', body.allowAutoPass ? 'warn' : 'ok');
+          toast('审核策略已保存', `终审 ${body.approvalLevels} 级${body.allowAutoPass ? ' · 已开启超时自动通过（注意风险）' : ' · 超时不自动通过'}`, body.allowAutoPass ? 'warn' : 'ok');
           paint();
         } catch (error) {
           button.disabled = false;
@@ -378,6 +397,7 @@ export default {
           leaseSeconds: num($('#set-lease', root).value, 45),
           scanIntervalMs: num($('#set-scan', root).value, 1200),
           enabled: $('#set-wf-enabled', root).getAttribute('aria-checked') === 'true',
+          llm_plan: $('#set-llm-plan', root).getAttribute('aria-checked') === 'true',
         };
         button.disabled = true;
         try {

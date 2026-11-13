@@ -97,6 +97,18 @@ function renderArtifact(payload, summary) {
   if (typeof payload.markdown === 'string') return `<div class="md">${markdown(payload.markdown)}</div>`;
   if (typeof payload.content === 'string') return `<div class="md">${markdown(payload.content)}</div>`;
   if (payload.verdict !== undefined && payload.total !== undefined) return renderQualityPayload(payload);
+  // 投标文件格式清单：先给表格，JSON 折起来
+  if (Array.isArray(payload.items)) {
+    return `<div class="md">
+      <p class="hint">${payload.sectionTitle ? `依据章节：${esc(payload.sectionTitle)}` : '未定位到「投标文件格式」章节，以下为通用清单'}</p>
+      <table><thead><tr><th style="width:56px">序号</th><th>投标文件组成</th><th>招标文件备注</th></tr></thead><tbody>
+        ${payload.items.map((item) => `<tr><td>${esc(String(item.no))}</td><td>${esc(item.content)}</td><td class="hint">${esc(item.note || '—')}</td></tr>`).join('')}
+      </tbody></table>
+      <p class="hint">必用表单 ${(payload.forms || []).length} 个${(payload.forms || []).length ? `：${payload.forms.map((f) => `格式${esc(f.no)} ${esc(f.name)}`).join('、')}` : '（未识别，提交前需人工核对招标文件附件）'}</p>
+      <details class="mt12"><summary class="hint pointer">查看原始 JSON</summary>
+        <pre class="mono" style="white-space:pre-wrap;background:var(--card-2);padding:10px;border-radius:8px;margin-top:6px">${esc(JSON.stringify(payload, null, 2).slice(0, 12000))}</pre></details>
+    </div>`;
+  }
   return `<div class="md"><p class="hint">结构化产物（JSON）</p>${jsonTable(payload)}
     <details class="mt12"><summary class="hint pointer">查看原始 JSON</summary>
       <pre class="mono" style="white-space:pre-wrap;background:var(--card-2);padding:10px;border-radius:8px;margin-top:6px">${esc(JSON.stringify(payload, null, 2).slice(0, 12000))}</pre></details></div>`;
@@ -240,7 +252,7 @@ export default {
         <div>
           <div class="row wrap" style="gap:8px">
             <span class="page-title">${esc(p.project?.name || '审核详情')}</span>
-            <span class="pill plain mono">${esc(p.gate_key)}</span>
+            <span class="pill plain">${esc(p.gate_label || p.gate_key)}</span>
             ${reviewStatusPill(p.status)}
             ${p.priority >= 2 ? `<span class="pill bad">优先级 ${esc(String(p.priority))}</span>` : ''}
           </div>
@@ -319,6 +331,11 @@ export default {
           <div class="grow">
             <div class="hint fs11">第 ${esc(String(q.iteration ?? 1))} 次评估 · ${Object.keys(dims).length} 个维度</div>
             <div class="hint fs11 mt4">阈值：≥80 达标 / 60-79 定向返工 / &lt;60 重新生成</div>
+            <div class="hint fs11 mt4">总分 = ${Object.entries(dims).map(([key, dim]) => `${dimLabel(key)}×${dim.weight}%`).join(' + ')}</div>
+            ${(() => {
+              const lowest = Object.entries(dims).sort((a, b) => Number(a[1].score ?? 0) - Number(b[1].score ?? 0))[0];
+              return lowest ? `<div class="hint fs11 mt4">主要拖分：${esc(dimLabel(lowest[0]))}（${esc(String(lowest[1].score))} 分，权重 ${esc(String(lowest[1].weight))}%）</div>` : '';
+            })()}
           </div>
         </div>
         <div class="stack mt12" style="gap:7px">
@@ -440,9 +457,58 @@ export default {
       </div>`;
     }
 
+    /** 这一关在确认什么：给“人”的说明，避免只看到通过/驳回不知道怎么判 */
+    function briefCard() {
+      const p = state.packet;
+      const items = p.checklist || [];
+      const track = p.level_track || [];
+      const currentLevel = track.find((t) => t.current) || {};
+      const roleName = ROLE_LABEL[currentLevel.role] || currentLevel.role || '项目负责人';
+      const nextLevel = Number(p.level) < Number(p.level_total) ? `通过后进入第 ${Number(p.level) + 1} 级（共 ${p.level_total} 级）` : '这是最后一级，通过后直接导出标书';
+      const chain = track.map((t) => `${ROLE_LABEL[t.role] || (String(t.role || '').startsWith('user') ? '指定审核人' : t.role) || '审核人'}${t.current ? '（当前）' : t.status === 'approved' ? ' ✓' : ''}`).join(' → ');
+      return `<div class="card mb16">
+        <div class="flex-between">
+          <div class="row" style="gap:8px"><span class="fw6" style="font-size:15px">你要确认什么</span><span class="pill info">${esc(p.gate_label || p.gate_key)}</span></div>
+          <span class="hint fs11">这一关只看下面几项</span>
+        </div>
+        <p style="margin:10px 0 12px;line-height:1.8;font-size:14.5px">${esc(p.purpose || '确认这一环节的产物是否符合招标要求。')}</p>
+        <div class="row wrap" style="gap:8px;margin-bottom:12px;padding:8px 10px;background:var(--card-2);border-radius:8px">
+          <span class="pill info">第 ${esc(String(p.level))}/${esc(String(p.level_total))} 级会签</span>
+          <span class="fs13">现在由 <b>${esc(roleName)}</b> 确认</span>
+          <span class="hint fs12">${esc(nextLevel)}</span>
+          ${chain ? `<span class="hint fs12">会签顺序：${esc(chain)}</span>` : ''}
+        </div>
+        ${(p.quality_iterations || []).length > 1 ? `
+        <div class="mt4" style="margin-bottom:12px">
+          <div class="fw6" style="font-size:13.5px;margin-bottom:6px">返工过程（共 ${p.quality_iterations.length} 轮，明细如下）</div>
+          <table class="table" style="font-size:12.5px">
+            <thead><tr><th style="width:64px">轮次</th><th style="width:64px">分数</th><th style="width:56px">Δ</th><th>本轮重跑的 Agent</th></tr></thead>
+            <tbody>${p.quality_iterations.map((it) => `<tr>
+              <td>第 ${esc(String(it.round))} 轮</td>
+              <td><b>${esc(String(it.total))}</b></td>
+              <td class="hint">${it.delta === null ? '—' : `${it.delta >= 0 ? '+' : ''}${it.delta}`}</td>
+              <td class="hint">${it.targets?.length ? it.targets.map((t) => `<span class="chip">${esc(t)}</span>`).join(' ') : (Number(it.round) > 1 ? '无（达上限，转人工）' : '首次评估')}</td>
+            </tr>`).join('')}</tbody>
+          </table>
+          <div class="hint fs11" style="margin-top:6px">每轮只重跑上表列出的 Agent；分数没再上涨，说明剩下的扣分项不是返工能解决的（缺材料/缺参数），需要你判断。</div>
+        </div>` : ''}
+        ${items.length ? items.map((i) => `<div class="finding ${i.ok ? 'ok' : 'bad'}" style="padding:10px 12px">
+          <span class="f-code">${i.ok ? '✓' : '!'}</span>
+          <div class="f-body">
+            <div class="f-title" style="font-size:13.5px">${esc(i.label)}：${esc(i.value)}</div>
+            ${i.detail ? `<div class="f-evidence" style="font-size:12.5px;line-height:1.65">${esc(i.detail)}</div>` : ''}
+          </div>
+        </div>`).join('') : '<div class="hint">本次没有自动核对项</div>'}
+        <div class="hint fs12 mt12" style="line-height:1.9">
+          ${(p.action_meaning || []).map((a) => `<b>${esc(a.label)}</b>：${esc(a.meaning)}`).join('　·　')}
+        </div>
+      </div>`;
+    }
+
     function paint() {
       if (state.destroyed) return;
       root.innerHTML = `${header()}
+        ${briefCard()}
         <div class="review-split">
           ${leftColumn()}
           <div class="stack-gap">${qualityCard()}${upstreamCard()}${historyCard()}${commentsCard()}</div>
@@ -537,11 +603,15 @@ export default {
             action, comment, targets: picked, edits, commandId: crypto.randomUUID(),
           });
           close();
-          toast('裁决已提交', `${ACTION_LABEL[action]}${result?.next_review ? ` · 进入第 ${result.next_review.level} 级` : ''}`, 'ok');
+          toast('裁决已提交', result?.next_review
+            ? `${ACTION_LABEL[action]} · 已进入第 ${result.next_review.level} 级会签`
+            : `${ACTION_LABEL[action]} · 全部会签完成，正在导出`, 'ok');
           if (result?.next_review?.id) {
             setTimeout(() => { location.hash = `#/reviews/${result.next_review.id}`; }, 500);
           } else {
-            setTimeout(() => { location.hash = '#/reviews'; }, 600);
+            // 全部会签结束：回到运行详情看导出进度，而不是踢回列表
+            const runId = state.packet?.run_id;
+            setTimeout(() => { location.hash = runId ? `#/runs/${runId}` : '#/reviews'; }, 600);
           }
         } catch (error) {
           button.disabled = false;

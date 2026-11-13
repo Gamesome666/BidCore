@@ -88,7 +88,7 @@ export default {
         <div class="page-head">
           <div>
             <div class="page-title">Agent 团队</div>
-            <div class="page-desc">9 个角色各司其职：<b>Supervisor 只调度不写内容</b> —— 它产出计划、按依赖并行派发、按质量/人工门禁决定返工，正文由专业 Agent 生成。</div>
+            <div class="page-desc">9 个角色各司其职：<b>Supervisor 只调度不写内容</b> —— 它产出计划、按依赖并行派发、按质量/人工门禁决定返工，正文由专业 Agent 生成。<br />提示词、模型档位、工具与启停<b>在下次运行时生效</b>（运行时由引擎注入每个节点）。</div>
           </div>
           <div class="page-actions">
             <div class="segmented">

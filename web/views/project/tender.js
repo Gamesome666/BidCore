@@ -1,6 +1,6 @@
-﻿// 招标解析：左侧需求条目表（可筛选）+ 右侧招标原文（点条目定位原文）
+// 招标解析：左侧需求条目表（可筛选）+ 右侧招标原文（点条目定位原文）
 import { api } from '../../lib/api.js';
-import { $, escapeHtml, fmtRelative, markdown, pill, emptyState, loading, toast } from '../../lib/ui.js';
+import { $, escapeHtml, fmtRelative, markdown, pill, emptyState, loading, toast, modal } from '../../lib/ui.js';
 import { CAT_KIND, categoryLabel } from './data.js';
 
 const TENDER_CACHE = new Map();
@@ -112,6 +112,89 @@ export default async function mount(container, host) {
     </div>`;
   }
 
+  /** 跑一次招标解析（上传后 / 手动重新解析共用），带进度回调 */
+  async function runParse() {
+    if (busy) return;
+    busy = true;
+    task = null;
+    paint();
+    try {
+      await host.trigger('parse', { onTick: (next) => { task = next; if (!disposed) paint(); } });
+      if (disposed) return;
+      toast('招标解析完成', `共 ${reqs().length} 条要求`, 'ok');
+      TENDER_CACHE.delete(host.pid);
+      await host.reload();
+    } catch (error) {
+      if (disposed) return;
+      toast('解析失败', error?.message || String(error), 'bad');
+      busy = false;
+      task = null;
+      paint();
+    }
+  }
+
+  /** 粘贴招标正文（扫描件 OCR 后 / 从别处复制文本时的兜底） */
+  function openPaste() {
+    if (busy) return;
+    const box = modal({
+      title: '粘贴招标正文',
+      wide: true,
+      body: `<div class="field">
+          <label>招标正文（Markdown 或纯文本均可，至少 200 字）</label>
+          <textarea class="textarea" id="td-paste-text" style="min-height:320px" placeholder="把招标文件正文粘贴到这里；扫描件可先用 OCR 工具转成文字">${escapeHtml(tender.text || '')}</textarea>
+          <div class="hint">保存后会立刻重新解析，替换当前招标正文。</div>
+        </div>`,
+      footer: '<button class="btn" data-modal-close>取消</button><button class="btn primary" id="td-paste-save">保存并解析</button>',
+    });
+    const save = $('#td-paste-save', box.root);
+    save.onclick = async () => {
+      const text = $('#td-paste-text', box.root).value.trim();
+      if (text.length < 200) { toast('正文太短', '至少需要 200 字', 'warn'); return; }
+      save.disabled = true;
+      save.textContent = '保存中…';
+      try {
+        await api.saveTenderText(host.pid, text);
+        box.close();
+        TENDER_CACHE.delete(host.pid);
+        tender = await loadTender(host.pid).catch(() => ({ text, name: '招标正文（粘贴）' }));
+        toast('招标正文已保存', `${text.length} 字`, 'ok');
+        await runParse();
+      } catch (error) {
+        save.disabled = false;
+        save.textContent = '保存并解析';
+        toast('保存失败', error?.message || String(error), 'bad');
+      }
+    };
+  }
+
+  /** 上传招标文件（docx/doc/wps/pdf/md/txt）→ 落库 → 自动解析 */
+  async function uploadTenderFile(file) {
+    if (busy) return;
+    if (!/\.(docx|doc|wps|pdf|md|txt)$/i.test(file.name)) {
+      toast('格式不支持', '请上传 docx / doc / wps / pdf / md / txt', 'warn');
+      return;
+    }
+    if (file.size > 25 * 1024 * 1024) {
+      toast('文件过大', '招标文件需小于 25MB', 'bad');
+      return;
+    }
+    busy = true;
+    task = null;
+    paint();
+    try {
+      const result = await api.uploadTender(host.pid, file);
+      TENDER_CACHE.delete(host.pid);
+      tender = await loadTender(host.pid).catch(() => ({ text: '', name: result.file }));
+      toast('招标文件已上传', `${result.file} · ${result.chars} 字${result.pages ? ` · ${result.pages} 页` : ''}`, 'ok');
+      await runParse();
+    } catch (error) {
+      busy = false;
+      task = null;
+      paint();
+      toast('上传失败', error?.message || String(error), 'bad');
+    }
+  }
+
   function paint() {
     if (disposed) return;
     const stat = summary();
@@ -121,6 +204,9 @@ export default async function mount(container, host) {
         <div class="fs12 muted">要求 <b class="ink num">${stat.total}</b> 条 · 技术 ${stat.technical} · 资格 ${stat.qualification} · 商务 ${stat.commercial} · 废标项 ${stat.veto}</div>
         <div class="right row" style="gap:8px">
           <span class="pill plain">${escapeHtml(tender.name)}</span>
+          <button class="btn sm" id="td-paste" ${busy ? 'disabled' : ''}>粘贴正文</button>
+          <button class="btn sm" id="td-upload" ${busy ? 'disabled' : ''}>上传招标文件</button>
+          <input type="file" id="td-file" accept=".docx,.doc,.wps,.pdf,.md,.txt" hidden />
           <button class="btn primary sm" id="td-reparse" ${busy ? 'disabled' : ''}>重新解析</button>
         </div>
       </div>
@@ -135,32 +221,26 @@ export default async function mount(container, host) {
           <div id="td-table">${tableMarkup()}</div>
         </div>
         <div class="wb-doc wb-pane" id="td-doc">
-          ${tender.text ? `<div class="md">${markdown(tender.text)}</div>` : emptyState('招标原文为空', '请在项目管理中粘贴招标文件全文', '▤')}
+          ${tender.text ? `<div class="md">${markdown(tender.text)}</div>` : emptyState('招标原文为空', '点击右上角「上传招标文件」（docx / pdf），或直接在项目管理里粘贴正文', '▤')}
         </div>
       </div>`;
 
-    const reparse = $('#td-reparse', container);
-    if (reparse) {
-      reparse.onclick = async () => {
-        if (busy) return;
-        busy = true;
-        task = null;
-        paint();
-        try {
-          await host.trigger('parse', { onTick: (next) => { task = next; if (!disposed) paint(); } });
-          if (disposed) return;
-          toast('招标解析完成', `共 ${reqs().length} 条要求`, 'ok');
-          TENDER_CACHE.delete(host.pid);
-          await host.reload();
-        } catch (error) {
-          if (disposed) return;
-          toast('解析失败', error?.message || String(error), 'bad');
-          busy = false;
-          task = null;
-          paint();
-        }
+    const fileInput = $('#td-file', container);
+    const uploadBtn = $('#td-upload', container);
+    if (uploadBtn && fileInput) {
+      uploadBtn.onclick = () => fileInput.click();
+      fileInput.onchange = () => {
+        const file = fileInput.files?.[0];
+        fileInput.value = '';
+        if (file) void uploadTenderFile(file);
       };
     }
+
+    const pasteBtn = $('#td-paste', container);
+    if (pasteBtn) pasteBtn.onclick = () => openPaste();
+
+    const reparse = $('#td-reparse', container);
+    if (reparse) reparse.onclick = () => { void runParse(); };
 
     for (const node of container.querySelectorAll('[data-filter]')) {
       node.onclick = () => { filter = node.dataset.filter; paint(); };
@@ -177,6 +257,28 @@ export default async function mount(container, host) {
         }
       };
     }
+  }
+
+  // 拖拽上传：整块页签都能投递（只绑一次，paint 不重复绑定）
+  if (!container.dataset.tenderDrop) {
+    container.dataset.tenderDrop = '1';
+    const highlight = (on) => {
+      container.style.outline = on ? '2px dashed var(--accent)' : '';
+      container.style.outlineOffset = on ? '-6px' : '';
+    };
+    container.addEventListener('dragover', (event) => {
+      if (!event.dataTransfer || ![...(event.dataTransfer.types || [])].includes('Files')) return;
+      event.preventDefault();
+      highlight(true);
+    });
+    container.addEventListener('dragleave', () => highlight(false));
+    container.addEventListener('drop', (event) => {
+      highlight(false);
+      const file = event.dataTransfer?.files?.[0];
+      if (!file) return;
+      event.preventDefault();
+      void uploadTenderFile(file);
+    });
   }
 
   container.innerHTML = loading('读取招标文件…');

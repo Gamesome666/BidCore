@@ -1,8 +1,8 @@
-﻿// 项目管理：项目卡网格 + 搜索 + 新建项目（可粘贴招标文件全文）
+// 项目管理：项目卡网格 + 搜索 + 新建项目（可粘贴招标文件全文）
 import { api } from '../lib/api.js';
 import {
   $, $$, escapeHtml, fmtDate, fmtRelative, countdown, pill, statusPill,
-  toast, emptyState, debounce, modal, loading,
+  toast, emptyState, debounce, modal, confirmDialog, loading,
 } from '../lib/ui.js';
 
 const STYLE = `
@@ -29,6 +29,12 @@ const STYLE = `
   .project-card .p-flag { position: absolute; top: 0; left: 0; width: 3px; height: 100%; border-radius: 10px 0 0 10px; background: transparent; }
   .project-card:hover .p-flag { background: var(--accent); }
   .project-card .p-count { min-width: 18px; height: 18px; padding: 0 5px; border-radius: 99px; background: var(--accent); color: #fff; font-size: 10.5px; font-weight: 650; display: inline-grid; place-items: center; }
+  .project-card .p-more { position: absolute; top: 8px; right: 8px; width: 26px; height: 26px; border: 1px solid var(--line-strong); border-radius: 7px; background: var(--card); color: var(--ink-3); font-size: 15px; line-height: 1; opacity: .85; transition: opacity .12s, border-color .12s, color .12s; }
+  .project-card:hover .p-more, .project-card .p-more:focus-visible { opacity: 1; border-color: var(--accent); color: var(--accent); }
+  .pj-danger-row { display: flex; align-items: center; gap: 10px; padding: 10px 12px; border: 1px solid color-mix(in oklab, var(--danger) 34%, transparent); background: color-mix(in oklab, var(--danger) 7%, transparent); border-radius: var(--radius-sm); }
+  .pj-del-table { width: 100%; border-collapse: collapse; font-size: 12px; }
+  .pj-del-table th, .pj-del-table td { text-align: left; padding: 5px 0; border-bottom: 1px dashed var(--line); font-weight: 400; }
+  .pj-del-table td:last-child { text-align: right; font-variant-numeric: tabular-nums; color: var(--ink-2); }
   .pj-empty { grid-column: 1 / -1; }
   @media (max-width: 1280px) { .pj-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
   @media (max-width: 720px) { .pj-grid { grid-template-columns: 1fr; } .pj-search .input { width: 130px; } }
@@ -125,6 +131,7 @@ export default {
           <button class="btn sm" data-act="run" data-id="${item.id}">▶ 启动工作流</button>
           <span class="right hint">${escapeHtml(item.run_count ? `${item.run_count} 次运行` : '')}</span>
         </div>
+        <button class="icon-btn p-more" data-more="${item.id}" title="更多操作" aria-label="更多操作">⋯</button>
       </article>`;
     }
 
@@ -172,6 +179,81 @@ export default {
       }
       const tile = $('#pj-new-tile', grid);
       if (tile) tile.onclick = openCreate;
+      for (const node of $$('[data-more]', grid)) {
+        node.onclick = (event) => {
+          event.stopPropagation();
+          const target = projects.find((item) => Number(item.id) === Number(node.dataset.more));
+          if (target) openProjectMenu(target);
+        };
+      }
+    }
+
+    /** 卡片右上角「⋯」：看关联数据量 + 删除项目 */
+    function openProjectMenu(item) {
+      const box = modal({
+        title: '项目操作',
+        body: `<div style="display:grid;gap:12px">
+            <div>
+              <div class="card-title" style="font-size:14px">${escapeHtml(item.name || '未命名项目')}</div>
+              <div class="hint fs11 mt4">${escapeHtml(item.code || '-')}${item.industry ? ` · ${escapeHtml(item.industry)}` : ''}</div>
+            </div>
+            <div id="pjm-counts">${loading('统计关联数据…')}</div>
+            <div class="pj-danger-row">
+              <div style="flex:1;min-width:0">
+                <div class="fs12" style="font-weight:600;color:var(--danger)">删除项目</div>
+                <div class="hint fs11">运行记录、产物、审核任务、质量报告、导出文件会一并删除，不可撤销。</div>
+              </div>
+              <button class="btn sm danger" id="pjm-del">删除</button>
+            </div>
+          </div>`,
+        footer: '<button class="btn" data-modal-close>关闭</button>',
+      });
+
+      api.deletionPreview(item.id).then((data) => {
+        const counts = data?.counts || {};
+        const rows = [
+          ['工作流运行', counts.runs],
+          ['节点执行', counts.nodes],
+          ['产物版本', counts.artifacts],
+          ['事件', counts.events],
+          ['审核任务', counts.reviews],
+          ['质量报告', counts.quality],
+          ['导出文件', counts.exports],
+          ['兼容任务', counts.tasks],
+        ].filter(([, value]) => Number(value) > 0);
+        const host = $('#pjm-counts', box.root);
+        if (!host) return;
+        host.innerHTML = rows.length
+          ? `<table class="pj-del-table"><tbody>${rows.map(([label, value]) => `<tr><th>${escapeHtml(label)}</th><td>${Number(value)}</td></tr>`).join('')}</tbody></table>`
+          : '<div class="hint fs11">该项目还没有运行、审核或导出数据，删除只移除项目本身。</div>';
+      }).catch((error) => {
+        const host = $('#pjm-counts', box.root);
+        if (host) host.innerHTML = `<div class="hint fs11">统计失败：${escapeHtml(error?.message || String(error))}</div>`;
+      });
+
+      $('#pjm-del', box.root).onclick = async () => {
+        box.close();
+        const ok = await confirmDialog(
+          `确定删除「${item.name || '未命名项目'}」？关联的运行、审核、导出数据会一并清除，且无法撤销。`,
+          { danger: true, okText: '确认删除' },
+        );
+        if (!ok) return;
+        try {
+          const result = await api.deleteProject(item.id);
+          const removed = result?.removed || {};
+          toast('项目已删除',
+            `清理 运行 ${removed.runs || 0} / 审核 ${removed.reviews || 0} / 导出 ${removed.exports || 0} / 文件 ${removed.files || 0}`,
+            'ok');
+          const wasCurrent = Number(ctx.project?.id) === Number(item.id);
+          projects = projects.filter((row) => Number(row.id) !== Number(item.id));
+          ctx.projects = projects;
+          if (wasCurrent) ctx.setProject(projects[0]?.id ?? 0);
+          ctx.refreshShell?.().catch(() => {});
+          paint();
+        } catch (error) {
+          toast('删除失败', error?.message || String(error), 'bad');
+        }
+      };
     }
 
     function openCreate() {
@@ -217,8 +299,13 @@ export default {
           </div>
           <div class="field span2">
             <label>招标文件全文</label>
+            <div class="row" style="gap:8px;align-items:center;margin-bottom:6px">
+              <button class="btn sm" type="button" id="np-import">从文件导入（docx / doc / pdf）</button>
+              <input type="file" id="np-file" accept=".docx,.doc,.wps,.pdf,.md,.txt" hidden />
+              <span class="hint fs11" id="np-import-hint">也可以直接在下面粘贴正文</span>
+            </div>
             <textarea class="textarea" id="np-tender" style="min-height:190px" placeholder="可直接粘贴招标文件全文：支持 Markdown 标题（# 一、项目概述）与编号条款（1. …），解析 Agent 据此抽取要求"></textarea>
-            <div class="hint">提示：可直接粘贴招标文件全文。留空也可以先建项目，稍后在项目工作台「招标解析」页签补充。</div>
+            <div class="hint">提示：导入或粘贴后即可解析；留空也可以先建项目，稍后在项目工作台「招标解析」页签补充或上传。</div>
           </div>
         </div>`,
         footer: `<button class="btn" data-modal-close>取消</button><button class="btn primary" id="np-submit">创建项目</button>`,
@@ -227,6 +314,38 @@ export default {
       const regen = $('#np-regen', modalRoot);
       regen.onclick = () => { $('#np-code', modalRoot).value = autoCode(projects); };
       $('#np-name', modalRoot).focus();
+
+      // 从文件导入招标正文：解析后回填文本框与项目元信息，避免先建项目再上传
+      const importBtn = $('#np-import', modalRoot);
+      const importFile = $('#np-file', modalRoot);
+      if (importBtn && importFile) {
+        importBtn.onclick = () => importFile.click();
+        importFile.onchange = async () => {
+          const file = importFile.files?.[0];
+          importFile.value = '';
+          if (!file) return;
+          importBtn.disabled = true;
+          importBtn.textContent = '解析中…';
+          try {
+            const result = await api.parseTenderFile(file);
+            $('#np-tender', modalRoot).value = result.text || '';
+            const hint = $('#np-import-hint', modalRoot);
+            if (hint) hint.textContent = `${result.file} · ${result.chars} 字${result.pages ? ` · ${result.pages} 页` : ''}`;
+            const meta = result.meta || {};
+            const fill = (id, value) => { const node = $(id, modalRoot); if (node && !node.value.trim() && value) node.value = value; };
+            fill('#np-name', meta.name);
+            fill('#np-code', meta.code);
+            fill('#np-budget', meta.budget);
+            fill('#np-client', meta.owner);
+            toast('已导入招标正文', `${result.file} · ${result.chars} 字`, 'ok');
+          } catch (error) {
+            toast('导入失败', error?.message || String(error), 'bad');
+          } finally {
+            importBtn.disabled = false;
+            importBtn.textContent = '从文件导入（docx / doc / pdf）';
+          }
+        };
+      }
 
       const submit = $('#np-submit', modalRoot);
       submit.onclick = async () => {

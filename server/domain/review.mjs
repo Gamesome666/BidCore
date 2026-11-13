@@ -35,7 +35,14 @@ function emitRunEvent(runId, type, payload = {}, actor = { type: 'system', id: n
 
 function policyLevels(policyKey) {
   const policy = get('SELECT * FROM review_policies WHERE key = ?', policyKey) || get("SELECT * FROM review_policies WHERE key='default'");
-  return jparse(policy?.levels_json, [{ level: 1, role: 'project-owner', sla_minutes: 240, on_timeout: 'remind-only' }]);
+  let levels = jparse(policy?.levels_json, [{ level: 1, role: 'project-owner', sla_minutes: 240, on_timeout: 'remind-only' }]);
+  // 「default」是多级会签模板，级数由平台设置决定：一个人做标书时设 1 级即可，
+  // 需要企业审批流时设 2–3 级；策略表本身不动，避免改坏 SLA 配置。
+  if ((policy?.key || 'default') === 'default') {
+    const configured = Number(loadSettings().review?.approvalLevels || levels.length);
+    if (configured >= 1 && configured < levels.length) levels = levels.slice(0, configured);
+  }
+  return levels;
 }
 
 function resolveAssignee(level, project) {
@@ -280,8 +287,181 @@ function supersedeArtifacts(runId, targetKeys, nodeRows) {
 }
 
 /** ReviewPacket：一次渲染所需的全部数据（viewer 用于计算 can_reassign，可省略） */
-export function buildPacket(task, viewer = null) {
-  const runRow = get('SELECT * FROM runs WHERE id = ?', task.run_id);
+const GATE_LABEL = {
+  'requirements-confirm': '要求确认',
+  'quality-gate': '质量门禁（返工到上限）',
+  'final-approval': '终审',
+  'review-1': '审核',
+  'review-2': '复核',
+};
+
+const GATE_PURPOSE = {
+  'requirements-confirm': '这一步确认「总控 Agent 打算怎么生成这本标书」：文件结构、技术方案大纲、取材来源、需要你补哪些材料、有哪些风险。确认后下游才会照这个计划开工。',
+  'quality-gate': '质量分没到 80，系统已经自动返工到上限，分数还是上不去。这一关交给你决定：接受现状继续出标书，还是驳回让 Agent 接着改。',
+  'final-approval': '这一步确认「整本标书能不能提交」。下面是组装好的全文，请通读后再点通过；通过后立刻导出 Word，导出之后再改要重新走流程。',
+};
+
+const ACTION_MEANING = [
+  { action: 'approve', label: '通过', meaning: '内容没问题，放行到下一步' },
+  { action: 'reject', label: '驳回', meaning: '方向不对，退回让 Agent 重做（本轮作废）' },
+  { action: 'modify', label: '修改', meaning: '按我写的意见改：要选目标 Agent 并写 ≥10 字意见' },
+  { action: 'reanalyze', label: '要求重新分析', meaning: '丢掉这一版，让 Agent 从头再分析一遍' },
+];
+
+/** 给「人」看的闸门说明：这一关在确认什么、要核对哪几项、四个按钮各是什么意思 */
+function buildGateBrief({ task, runRow, quality }) {
+  const checklist = [];
+  const latest = (kind) => get(
+    "SELECT * FROM artifacts WHERE run_id=? AND kind=? AND status!='superseded' ORDER BY version DESC LIMIT 1",
+    task.run_id, kind,
+  );
+
+  const plan = latest('bid.plan');
+  if (plan) {
+    const payload = jparse(plan.payload_json, {});
+    const doc = payload.document || {};
+    const tech = payload.technical || {};
+    checklist.push({
+      label: '投标文件结构',
+      value: `${doc.items?.length || 0} 项`,
+      ok: (doc.items?.length || 0) >= 8,
+      detail: (doc.items || []).map((item) => `${item.no}. ${item.title}（${item.source}）`).join('；') || '未生成结构',
+    });
+    checklist.push({
+      label: '技术方案大纲',
+      value: `${tech.chapters?.length || 0} 章 / 规划 ${Number(tech.total_words || 0)} 字`,
+      ok: (tech.chapters?.length || 0) >= 5,
+      detail: (tech.chapters || []).map((c) => `${c.no} ${c.title}（${c.requirements} 条要求）`).join('；'),
+    });
+    checklist.push({
+      label: '需人工补的材料',
+      value: `${(payload.missing || []).length} 项`,
+      ok: !(payload.missing || []).length,
+      detail: (payload.missing || []).join('；') || '知识库已覆盖',
+    });
+    checklist.push({
+      label: '风险',
+      value: `${(payload.risks || []).length} 条`,
+      ok: !(payload.risks || []).length,
+      detail: (payload.risks || []).join('；') || '无',
+    });
+  }
+
+  const format = latest('tender.format');
+  if (format && !plan) {
+    const payload = jparse(format.payload_json, {});
+    const items = payload.items || [];
+    const forms = payload.forms || [];
+    checklist.push({
+      label: '投标文件组成',
+      value: `${items.length} 项`,
+      ok: items.length >= 10,
+      detail: items.slice(0, 12).map((item) => `${item.no}. ${item.content}`).join('；') || '未解析到清单',
+    });
+    checklist.push({
+      label: '必用表单',
+      value: `${forms.length} 个`,
+      ok: forms.length > 0,
+      detail: forms.length ? forms.map((f) => `格式${f.no} ${f.name}`).join('；') : '未识别到表单，提交前需人工核对招标文件附件',
+    });
+    checklist.push({
+      label: '依据章节',
+      value: payload.sectionTitle || '未定位',
+      ok: Boolean(payload.sectionTitle),
+      detail: payload.sectionTitle ? `从「${payload.sectionTitle}」解析` : '标题里没找到「投标文件格式/组成」，当前用的是通用 12 项',
+    });
+  }
+
+  const analysis = latest('tender.analysis');
+  if (analysis) {
+    const meta = jparse(analysis.payload_json, {}).project || {};
+    checklist.push({
+      label: '项目信息',
+      value: [meta.name, meta.code].filter(Boolean).join(' · ') || '未识别',
+      ok: Boolean(meta.code),
+      detail: [meta.owner && `采购人：${meta.owner}`, meta.budget && `预算：${meta.budget}`, meta.duration && `工期：${meta.duration}`]
+        .filter(Boolean).join('；'),
+    });
+  }
+
+  const document = latest('bid.document');
+  if (document) {
+    const payload = jparse(document.payload_json, {});
+    checklist.push({
+      label: '标书全文',
+      value: `${Number(payload.words || 0)} 字 / ${(payload.sections || []).length} 项`,
+      ok: Number(payload.words || 0) > 3000,
+      detail: (payload.sections || []).map((s) => `${s.no} ${s.title}`).join('；'),
+    });
+    checklist.push({
+      label: '待编制项',
+      value: `${(payload.gaps || []).length} 项`,
+      ok: !(payload.gaps || []).length,
+      detail: (payload.gaps || []).join('；') || '无',
+    });
+  }
+
+  if (quality) {
+    const iteration = Number(quality.iteration || 0);
+    const passScore = Number(loadSettings().quality?.passScore ?? 80);
+    checklist.push({
+      label: '质量分',
+      value: `${quality.total_score} 分`,
+      ok: Number(quality.total_score) >= Number(loadSettings().quality?.passScore ?? 80),
+      detail: `已自动评估 ${iteration || 1} 轮，最高 ${quality.total_score} 分；判为「${quality.verdict}」${quality.verdict === 'revise' ? '——差一点，返工也没能突破' : ''}`,
+    });
+  }
+
+  const consistency = latest('consistency.report');
+  if (consistency) {
+    const conflicts = jparse(consistency.payload_json, {}).conflicts || [];
+    checklist.push({
+      label: '一致性冲突',
+      value: `${conflicts.length} 条`,
+      ok: conflicts.length === 0,
+      detail: conflicts.slice(0, 3).map((c) => c.detail).join('；') || '项目名/编号/金额/工期口径一致',
+    });
+  }
+
+  const doc = latest('doc.docx');
+  if (doc) {
+    const gaps = jparse(doc.payload_json, {}).gaps || [];
+    checklist.push({ label: '待编制项', value: `${gaps.length} 项`, ok: gaps.length === 0, detail: gaps.join('；') || '无' });
+  }
+
+  const purpose = task.gate_key === 'quality-gate' && quality
+    ? `质量分 ${quality.total_score} 分没到及格线，系统已经自动返工到上限（${Number(quality.iteration || 1)} 轮）。这一关交给你决定：接受现状继续出标书，还是驳回让 Agent 接着改。`
+    : GATE_PURPOSE[task.gate_key] || '确认这一环节的产物是否符合招标要求，再决定放行或打回。';
+
+  return {
+    purpose,
+    checklist,
+    action_meaning: ACTION_MEANING,
+  };
+}
+
+/** 质量迭代轨迹：每轮分数 + 本轮被点名重跑的 Agent（取自 quality.revise 事件） */
+function buildQualityIterations(runId) {
+  const reports = all(
+    'SELECT iteration, total_score, verdict, created_at FROM quality_reports WHERE run_id=? ORDER BY created_at ASC',
+    runId,
+  );
+  const targetsByIteration = new Map();
+  for (const event of all("SELECT payload_json FROM events WHERE run_id=? AND type='quality.revise' ORDER BY seq ASC", runId)) {
+    const payload = jparse(event.payload_json, {});
+    if (payload.iteration !== undefined) targetsByIteration.set(Number(payload.iteration), payload.targets || []);
+  }
+  return reports.map((report, index) => ({
+    round: Number(report.iteration) || index + 1,
+    total: Number(report.total_score),
+    verdict: report.verdict,
+    delta: index ? Number(report.total_score) - Number(reports[index - 1].total_score) : null,
+    targets: targetsByIteration.get(Number(report.iteration)) || [],
+    at: report.created_at,
+  }));
+}
+
+export function buildPacket(task, viewer = null) {  const runRow = get('SELECT * FROM runs WHERE id = ?', task.run_id);
   const nodeRows = all('SELECT * FROM node_runs WHERE run_id = ?', task.run_id);
   const artifact = get('SELECT * FROM artifacts WHERE run_id = ? AND kind = ? ORDER BY version DESC LIMIT 1', task.run_id, task.artifact_kind);
   const prev = artifact
@@ -293,6 +473,8 @@ export function buildPacket(task, viewer = null) {
   const targets = [...new Set(nodeRows.filter((n) => ancestors.has(n.node_key)).map((n) => n.agent_key))]
     .filter((a) => AGENT_LABEL[a])
     .map((a) => ({ agent_key: a, label: AGENT_LABEL[a] }));
+
+  const brief = buildGateBrief({ task, runRow, quality });
 
   // 多级进度：已实例化的审核任务 + policy 里尚未到达的级别（status='queued'）
   const policyKey = task.policy_key || 'default';
@@ -402,7 +584,21 @@ export function buildPacket(task, viewer = null) {
       iteration: quality.iteration,
       report_id: quality.id,
       override: readOverride(jparse(quality.judge_json, {})),
-    } : null,
+      stage: 'post_quality',
+    } : {
+      // 十步流水线里「要求确认」闸门在质检之前，这里给一个明确的占位，
+      // 前端据此显示"本次审核在质检前，无质量分"，而不是空白或报错
+      total: 0,
+      verdict: 'pending',
+      dimensions: {},
+      findings: [],
+      judge: {},
+      iteration: 0,
+      report_id: null,
+      override: null,
+      stage: 'pre_quality',
+      note: '该闸门在质量门禁之前，尚无质量分',
+    },
     diff,
     history: history.map((h) => ({
       level: h.level, action: h.action, comment: h.comment,
@@ -410,6 +606,11 @@ export function buildPacket(task, viewer = null) {
       at: h.created_at, targets: jparse(h.targets_json, []),
     })),
     allowed_actions: ['approve', 'reject', 'modify', 'reanalyze'],
+    gate_label: GATE_LABEL[task.gate_key] || task.gate_key,
+    quality_iterations: buildQualityIterations(task.run_id),
+    purpose: brief.purpose,
+    checklist: brief.checklist,
+    action_meaning: brief.action_meaning,
     targets,
     allowed_targets: targets,
     level_track: levelTrack,

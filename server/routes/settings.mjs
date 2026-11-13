@@ -30,6 +30,12 @@ export function register(router) {
       try { assertQualityConfig(next.quality); } catch (error) { return sendError(res, 400, 'QUALITY_CONFIG_INVALID', String(error.message)); }
     }
     if (body.llm?.api_key === '******') next.llm.api_key = current.llm.api_key;
+    // 防呆：选了 openai 却没给 key/base_url，直接报错，避免“以为接上了、其实还是模板”
+    if (next.llm && String(next.llm.mode) === 'openai') {
+      const merged = { ...current.llm, ...next.llm };
+      if (!merged.api_key) return sendError(res, 400, 'LLM_KEY_REQUIRED', '运行模式为 openai 时必须填写 API Key，否则正文仍会用模板生成');
+      if (!merged.base_url) return sendError(res, 400, 'LLM_BASE_URL_REQUIRED', '运行模式为 openai 时必须填写 Base URL（如 https://api.deepseek.com/v1）');
+    }
     for (const key of ['llm', 'quality', 'workflow', 'review']) {
       if (!next[key]) continue;
       run(`INSERT INTO settings (key, value_json, updated_at) VALUES (?,?,?)

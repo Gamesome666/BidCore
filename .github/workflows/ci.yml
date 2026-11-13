@@ -58,7 +58,7 @@ jobs:
           done
           echo "server failed to start"; cat .ci/server.log; exit 1
 
-      - name: 冒烟测试（42 通过 / 1 跳过 为基线）
+      - name: 冒烟测试（68 通过 / 0 失败 / 1 跳过 为基线）
         env:
           BIDCORE_BASE: http://127.0.0.1:5197
         run: node server/smoke.mjs

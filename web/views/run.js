@@ -121,6 +121,8 @@ export default {
       lastSeq: 0,
       sup: null,
       artifacts: [],
+      qualityRows: [],
+      docDownload: null,
       timer: null,
       busy: false,
       destroyed: false,
@@ -149,6 +151,46 @@ export default {
         state.sup = await api.supervisor(runId);
       } catch {
         state.sup = null; // 接口未就绪：降级到 plan + 事件流
+      }
+    }
+
+    async function loadTechMeta() {
+      try {
+        const rows = await api.artifact(runId, 'tech.content');
+        const payload = rows?.[0]?.payload_json;
+        state.techMeta = payload
+          ? { words: payload.total_words, rewritten: payload.llm_rewritten, error: payload.llm_error }
+          : null;
+      } catch {
+        state.techMeta = null;
+      }
+    }
+
+    async function loadLlmStatus() {
+      try {
+        state.llm = await api.llmStatus();
+      } catch {
+        state.llm = null;
+      }
+    }
+
+    async function loadQualityRows() {
+      try {
+        state.qualityRows = await api.quality(runId);
+      } catch {
+        state.qualityRows = [];
+      }
+    }
+
+    async function loadDocDownload() {
+      try {
+        const rows = await api.artifact(runId, 'doc.docx');
+        const payload = rows?.[0]?.payload_json;
+        state.docDownload = payload?.file
+          ? { file: payload.file, size: payload.size, words: payload.words, sections: payload.sections?.length, gaps: payload.gaps?.length }
+          : null;
+      } catch {
+        state.docDownload = null;
       }
     }
 
@@ -256,6 +298,99 @@ export default {
           <div class="k-value">${(b.usedTokens / 1000).toFixed(0)}<small>K tokens</small></div>
           <div class="bar thin mt8"><i style="width:${Math.min(100, (b.usedTokens / b.maxTokens) * 100).toFixed(1)}%"></i></div>
           <div class="k-foot">Agent 调用 ${b.usedCalls}/${b.maxCalls} · 墙钟 ${fmtDuration(b.wall)}</div></div>
+      </div>`;
+    }
+
+    /** 模型未启用 / 调用失败提示：让“为什么正文像模板”一眼可见 */
+    function llmBanner() {
+      const llm = state.llm;
+      const tech = state.techMeta;
+      if (!llm) return '';
+      if (llm.mode === 'mock') {
+        return `<div class="card mb16" style="border-color:var(--amber,#b7791f)">
+          <div class="flex-between">
+            <div>
+              <div class="fw6" style="font-size:14px">本次正文由模板生成（模型未启用）</div>
+              <div class="hint fs12" style="margin-top:4px">平台设置里当前是 mock 模式，技术方案每章只有 200–350 字。填好 Base URL 与 API Key 并保存后重跑，才会由模型逐章生成。</div>
+            </div>
+            <a class="btn accent" href="#/settings">去配置模型</a>
+          </div>
+        </div>`;
+      }
+      if (tech?.error) {
+        return `<div class="card mb16" style="border-color:var(--danger,#c53030)">
+          <div class="flex-between">
+            <div>
+              <div class="fw6" style="font-size:14px">模型调用失败，正文已回退模板</div>
+              <div class="hint fs12" style="margin-top:4px">错误：${esc(String(tech.error).slice(0, 160))}</div>
+              <div class="hint fs12">常见原因：模型名不被服务端接受、Base URL 少 /v1、Key 无效或额度不足。</div>
+            </div>
+            <a class="btn accent" href="#/settings">去检查配置</a>
+          </div>
+        </div>`;
+      }
+      return '';
+    }
+
+    /** 跑完后最该看到的东西：标书文件下载 */
+    function downloadCard() {
+      const doc = state.docDownload;
+      if (!doc?.file) return '';
+      const size = doc.size ? `${(doc.size / 1024).toFixed(1)} KB` : '';
+      return `<div class="card mb16" style="border-color:var(--accent)">
+        <div class="flex-between">
+          <div>
+            <div class="fw6" style="font-size:14.5px">投标文件已生成，可下载</div>
+            <div class="hint fs12" style="margin-top:4px">${esc(doc.sections ? `${doc.sections} 项 · ` : '')}${esc(size)}${doc.words ? ` · ${doc.words} 字` : ''}${doc.gaps ? ` · 待编制 ${doc.gaps} 项` : ''}</div>
+          </div>
+          <a class="btn accent" href="${esc(doc.file)}" download>下载 Word（.docx）</a>
+        </div>
+      </div>`;
+    }
+
+    /** 质量迭代轨迹：让人看见“返工了几轮、每轮多少分、差在哪” */
+    function qualityTimeline() {
+      const rows = state.qualityRows || [];
+      if (!rows.length) return '';
+      const cell = (row, index) => {
+        const prev = index ? Number(rows[index - 1].total_score) : null;
+        const delta = prev === null ? '—' : `${Number(row.total_score) - prev >= 0 ? '+' : ''}${Number(row.total_score) - prev}`;
+        const findings = (row.findings_json || []).filter((f) => Number(f.score) < 100).slice(0, 3)
+          .map((f) => `${f.rule} ${f.score}：${String(f.message || '').slice(0, 26)}`).join('；');
+        const cls = row.verdict === 'pass' ? 'ok' : row.verdict === 'revise' ? 'warn' : 'bad';
+        return `<tr>
+          <td>第 ${Number(row.iteration || index + 1)} 轮</td>
+          <td><b>${esc(String(row.total_score))}</b></td>
+          <td class="hint">${esc(delta)}</td>
+          <td><span class="pill ${cls}">${esc(row.verdict === 'pass' ? '达标' : row.verdict === 'revise' ? '定向返工' : '重新生成')}</span></td>
+          <td class="hint">${esc(findings || '—')}</td>
+        </tr>`;
+      };
+      return `<div class="card mb16">
+        <div class="flex-between">
+          <div class="fw6">质量迭代轨迹 <span class="hint fs11">共评估 ${rows.length} 轮，最多 3 轮后转人工</span></div>
+          <a class="btn sm" href="#/quality?runId=${encodeURIComponent(runId)}">查看完整质量报告</a>
+        </div>
+        <table class="table" style="font-size:12px;margin-top:8px">
+          <thead><tr><th style="width:72px">轮次</th><th style="width:64px">分数</th><th style="width:56px">Δ</th><th style="width:88px">判定</th><th>主要扣分项</th></tr></thead>
+          <tbody>${rows.map(cell).join('')}</tbody>
+        </table>
+        <div class="hint fs11" style="margin-top:8px">每轮只重跑被判定的 Agent（如 knowledge / tech / commercial），不是整条流水线重来；返工上限取「平台设置 → 最大迭代」。</div>
+      </div>`;
+    }
+
+    /** 人工闸门横幅：让“该我签了”一眼可见，不用去审核中心翻 */
+    function gateBanner() {
+      const pending = pendingReviews();
+      if (!pending.length || run().status !== 'waiting_human') return '';
+      return `<div class="card mb16" style="border-color:var(--accent)">
+        <div class="flex-between">
+          <div>
+            <div class="fw6" style="font-size:14.5px">流程停在人工审核：${pending.length} 项等你确认</div>
+            <div class="hint fs12" style="margin-top:4px">通过后流程会自动继续；也可以稍后在「审核中心」处理。</div>
+          </div>
+          <button class="btn accent" data-go="review">现在去审核 →</button>
+        </div>
       </div>`;
     }
 
@@ -387,6 +522,10 @@ export default {
       const r = run();
       root.innerHTML = `
         ${header()}
+        ${llmBanner()}
+        ${downloadCard()}
+        ${gateBanner()}
+        ${qualityTimeline()}
         ${kpis()}
         <div class="grid side-lg">
           <div class="stack-gap">
@@ -562,13 +701,29 @@ export default {
       });
     }
 
+    /** 刚启动的运行到达闸门时，自动把人送到审核页（只自动跳一次） */
+    function maybeOpenReview() {
+      try {
+        if (sessionStorage.getItem('bidcore.autoReview') !== runId) return false;
+        const pending = pendingReviews();
+        if (!pending.length) return false;
+        sessionStorage.removeItem('bidcore.autoReview');
+        toast('流程到达人工闸门', '已自动打开审核页，确认后自动继续', 'ok');
+        location.hash = `#/reviews/${pending[0].id}`;
+        return true;
+      } catch {
+        return false;
+      }
+    }
+
     async function tick(force = false) {
       if (state.busy && !force) return;
       if (state.destroyed) return;
       state.busy = true;
       try {
-        await Promise.all([loadSnapshot(), loadEvents(false), loadSupervisor(), loadArtifacts()]);
+        await Promise.all([loadSnapshot(), loadEvents(false), loadSupervisor(), loadArtifacts(), loadQualityRows(), loadDocDownload(), loadLlmStatus(), loadTechMeta()]);
         paint();
+        if (maybeOpenReview()) return;
       } catch (error) {
         if (!state.snap) {
           root.innerHTML = `<div class="card"><div class="card-title">运行加载失败</div>
@@ -604,8 +759,9 @@ export default {
         <div class="row mt12"><a class="btn sm" href="#/runs">返回运行看板</a></div></div>`;
       return { refresh: () => {}, destroy: () => {} };
     }
-    await Promise.all([loadEvents(true), loadSupervisor(), loadArtifacts()]);
+    await Promise.all([loadEvents(true), loadSupervisor(), loadArtifacts(), loadQualityRows(), loadDocDownload(), loadLlmStatus(), loadTechMeta()]);
     paint();
+    maybeOpenReview();
 
     return {
       refresh: () => { tick().catch(() => {}); },

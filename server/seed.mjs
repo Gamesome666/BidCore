@@ -117,28 +117,45 @@ const AGENTS = [
   ['compliance', '合规审查 Agent', 'compliance-auditor', '检查废标风险、响应偏离与资格满足情况', 'strong', '["check_rejection","check_deviations"]', '你是合规审查官，逐条核对废标条款与资格要求，缺一即报 veto。'],
   ['quality', '质量评估 Agent', 'quality-judge', '规则校验 + 受限评委，输出五维分与返工建议', 'standard', '["run_rules","blind_review"]', '你是质量评估员，只按 rubric 打分并引用证据，不评价文风。'],
   ['doc', '文档生成 Agent', 'doc-builder', '合并章节、校验编号、导出 Word 并回填元数据', 'fast', '["merge_sections","export_docx"]', '你是文档工程师，负责版式、编号与导出校验。'],
+  ['doc-preview', '标书预览 Agent', 'doc-previewer', '终审前组装整本标书正文，供人工通读确认', 'fast', '["merge_sections"]', '你是文档工程师，按投标文件格式把各章组装成完整标书，保持编号与顺序。'],
   ['supervisor', 'Supervisor 总控', 'orchestrator', '规划与重规划：决定调用哪些 Agent、是否并行、是否返工', 'strong', '["plan","replan","dispatch"]', '你是工作流总控，只产出计划，不撰写任何标书内容。'],
+  ['format', '招标格式 Agent', 'format-extractor', '提取第七章投标文件组成与必用表单，生成投标文件目录骨架', 'fast', '["read_tender","extract_format"]', '你是投标文件编制顾问，只依据招标文件第七章与 3.3 清单生成目录，不臆造章节。'],
+  ['doc-plan', '编制计划 Agent', 'bid-planner', '把解析结果落成编制方案：文件结构、技术大纲、取材来源、需人工补的材料与风险', 'strong', '["read_analysis","read_knowledge","build_outline"]', '你是投标项目总控，负责把招标要求翻译成可执行的编制计划：每一项谁写、从哪取材、缺什么、有什么风险，让人一眼能确认。'],
+  ['qualification-review', '资格审查 Agent', 'qualification-auditor', '核对资格条款与企业资质证书，标注证据与缺口', 'strong', '["read_analysis","search_knowledge"]', '你是资格审查员，逐条比对证书名称、编号、有效期，缺证必须列为缺口。'],
+  ['technical-review', '技术审查 Agent', 'technical-auditor', '核对技术参数与响应能力，标注偏离与证据缺口', 'strong', '["read_analysis","check_parameters"]', '你是技术审查员，按参数逐条给结论，区分正偏离/无偏离/负偏离。'],
+  ['material-review', '材料审查 Agent', 'material-auditor', '核对证明材料清单（授权函、承诺函、保函、扫描件）', 'standard', '["read_analysis","check_materials"]', '你是材料审查员，只判断材料是否齐备与是否过期，不评价内容质量。'],
+  ['other-review', '其他审查 Agent', 'other-auditor', '兜底审查：政策、格式、递交与其他杂项要求', 'standard', '["read_analysis","check_misc"]', '你是综合审查员，处理政策、格式、递交方式等其他类要求。'],
+  ['legal', '法规与案例 Agent', 'legal-researcher', '按招标引用的法规/标准检索知识库，给出可引用案例', 'standard', '["search_regulation","search_cases"]', '你是投标法规顾问，只引用知识库中真实存在的标准与案例，找不到就报缺口。'],
+  ['consistency', '一致性检查 Agent', 'consistency-checker', '跨章节核对项目名、编号、金额、工期、质保等口径', 'fast', '["check_numbers","check_names"]', '你是一致性检查员，只报客观冲突，不做文风评价。'],
+  ['summary', '汇总 Agent', 'summarizer', '把整条流水线的产物压成一页编制说明，供终审与交付', 'fast', '["summarize"]', '你是投标项目经理，输出结构化摘要与待办清单。'],
 ];
 
 export const FALLBACK_PLAN = {
-  plan_version: 1,
-  objective: '标准投标全流程：解析 → 检索 → 策略 → 技术/商务 → 合规 → 质量 → 人工审核 → 导出',
+  plan_version: 2,
+  objective: '十步投标流水线：上传/解析 → 格式提取 → 要求确认 → 四类审查 → 法规/案例 → 技术/商务生成 → 一致性 → 质检 → 终审 → 汇总 → 导出',
   nodes: [
     { node_key: 'parse-tender', agent_key: 'parse-tender', node_type: 'agent', depends_on: [] },
     { node_key: 'knowledge', agent_key: 'knowledge', node_type: 'agent', depends_on: ['parse-tender'] },
-    { node_key: 'strategy', agent_key: 'bid-strategy', node_type: 'agent', depends_on: ['parse-tender', 'knowledge'] },
-    { node_key: 'quality-1', agent_key: 'quality', node_type: 'quality', depends_on: ['strategy'] },
-    { node_key: 'review-1', agent_key: 'supervisor', node_type: 'human-review', depends_on: ['quality-1'], review_policy_key: 'single', gate_policy: 'always-human' },
-    { node_key: 'tech', agent_key: 'tech', node_type: 'agent', depends_on: ['review-1'], params: { generate_outline: true, generate_content: true } },
-    { node_key: 'commercial', agent_key: 'commercial', node_type: 'agent', depends_on: ['review-1', 'knowledge'] },
-    { node_key: 'compliance', agent_key: 'compliance', node_type: 'agent', depends_on: ['tech', 'commercial'] },
-    { node_key: 'quality-2', agent_key: 'quality', node_type: 'quality', depends_on: ['compliance', 'tech', 'commercial'] },
-    { node_key: 'review-2', agent_key: 'supervisor', node_type: 'human-review', depends_on: ['quality-2'], review_policy_key: 'default', gate_policy: 'always-human' },
-    { node_key: 'export', agent_key: 'doc', node_type: 'export', depends_on: ['review-2'] },
+    { node_key: 'format-extract', agent_key: 'format', node_type: 'agent', depends_on: ['parse-tender'] },
+    { node_key: 'doc-plan', agent_key: 'doc-plan', node_type: 'agent', depends_on: ['format-extract', 'knowledge'] },
+    { node_key: 'requirements-confirm', agent_key: 'supervisor', node_type: 'human-review', depends_on: ['doc-plan', 'format-extract', 'knowledge'], review_policy_key: 'single', gate_policy: 'always-human' },
+    { node_key: 'qualification-review', agent_key: 'qualification-review', node_type: 'agent', depends_on: ['requirements-confirm', 'knowledge'] },
+    { node_key: 'technical-review', agent_key: 'technical-review', node_type: 'agent', depends_on: ['requirements-confirm', 'knowledge'] },
+    { node_key: 'material-review', agent_key: 'material-review', node_type: 'agent', depends_on: ['requirements-confirm', 'knowledge'] },
+    { node_key: 'other-review', agent_key: 'other-review', node_type: 'agent', depends_on: ['requirements-confirm', 'knowledge'] },
+    { node_key: 'legal-research', agent_key: 'legal', node_type: 'agent', depends_on: ['technical-review', 'qualification-review'] },
+    { node_key: 'tech', agent_key: 'tech', node_type: 'agent', depends_on: ['legal-research', 'technical-review'], params: { generate_outline: true, generate_content: true } },
+    { node_key: 'commercial', agent_key: 'commercial', node_type: 'agent', depends_on: ['legal-research', 'material-review', 'knowledge'] },
+    { node_key: 'consistency', agent_key: 'consistency', node_type: 'agent', depends_on: ['tech', 'commercial'] },
+    { node_key: 'quality-gate', agent_key: 'quality', node_type: 'quality', depends_on: ['consistency', 'tech', 'commercial'] },
+    { node_key: 'preview', agent_key: 'doc-preview', node_type: 'agent', depends_on: ['quality-gate'], params: { preview: true } },
+    { node_key: 'final-approval', agent_key: 'supervisor', node_type: 'human-review', depends_on: ['preview'], review_policy_key: 'default', gate_policy: 'always-human' },
+    { node_key: 'summary', agent_key: 'summary', node_type: 'agent', depends_on: ['final-approval'] },
+    { node_key: 'export', agent_key: 'doc', node_type: 'export', depends_on: ['summary'] },
   ],
   budget: { max_tokens: 3000000, max_wall_ms: 14400000, max_agent_calls: 40 },
   stop_conditions: ['veto_unresolved', 'budget_exceeded', 'quality_iteration_limit'],
-  rationale: 'FallbackPlan：确定性 DAG，保证任何情况下都能完整产出标书。',
+  rationale: 'FallbackPlan：十步投标流水线，覆盖格式提取、四类审查、法规/案例、一致性与终审。',
 };
 
 const envLlm = () => ({
@@ -161,7 +178,7 @@ export const DEFAULT_SETTINGS = {
     thresholds: { duplicateSimilarity: 0.72, minSectionWords: 120, certWarnDays: 45 },
   },
   workflow: { enabled: true, parallelism: 2, leaseSeconds: 45, scanIntervalMs: 1200 },
-  review: { allowAutoPass: false, remindRatio: 0.75 },
+  review: { allowAutoPass: false, remindRatio: 0.75, approvalLevels: 3 },
 };
 
 export function seed() {
@@ -229,8 +246,8 @@ export function seed() {
   tx(() => {
     run(
       'INSERT INTO workflow_defs (id, key, version, name, description, graph_json, policy_json, active, created_at) VALUES (?,?,?,?,?,?,?,?,?)',
-      id('wfd'), 'default', 1, '标准投标工作流',
-      '解析 → 知识检索 → 策略 → 质量门禁 → 人工审核（策略确认）→ 技术/商务并行 → 合规 → 质量 → 三级人工审核 → 导出',
+      id('wfd'), 'default', 2, '十步投标流水线',
+      '解析 → 知识检索 → 格式提取 → 要求确认 → 四类审查 → 法规/案例 → 技术/商务并行 → 一致性 → 质量门禁 → 终审 → 汇总 → 导出',
       jstr(FALLBACK_PLAN), jstr({ parallelism: 2, max_budget: FALLBACK_PLAN.budget }), 1, now,
     );
     run(
@@ -276,5 +293,39 @@ export function loadSettings() {
     try { out[row.key] = { ...(out[row.key] || {}), ...JSON.parse(row.value_json) }; } catch { /* ignore */ }
   }
   return out;
+}
+
+/**
+ * 老库升级：补齐新增的 Agent 与十步工作流，不动用户改过的提示词。
+ * 每次启动都调用（幂等），保证 `git pull` 后直接可用。
+ */
+export function ensureCatalog() {
+  const now = nowIso();
+  const added = [];
+  let sort = get('SELECT MAX(sort) AS s FROM agents')?.s ?? 0;
+  for (const [key, name, role, desc, tier, tools, prompt] of AGENTS) {
+    if (get('SELECT id FROM agents WHERE id=?', key)) continue;
+    sort += 1;
+    run(
+      'INSERT INTO agents (id, name, role, description, model_tier, tools, system_prompt, enabled, sort) VALUES (?,?,?,?,?,?,?,?,?)',
+      key, name, role, desc, tier, tools, prompt, 1, sort,
+    );
+    added.push(key);
+  }
+
+  const active = get("SELECT * FROM workflow_defs WHERE key='default' AND active=1 ORDER BY version DESC LIMIT 1");
+  const graph = active ? JSON.parse(active.graph_json || '{}') : null;
+  const upgraded = !graph?.nodes?.some((node) => node.node_key === 'preview');
+  if (upgraded) {
+    const maxVersion = get("SELECT MAX(version) AS v FROM workflow_defs WHERE key='default'")?.v || 0;
+    run("UPDATE workflow_defs SET active=0 WHERE key='default'");
+    run(
+      'INSERT INTO workflow_defs (id, key, version, name, description, graph_json, policy_json, active, created_at) VALUES (?,?,?,?,?,?,?,?,?)',
+      id('wfd'), 'default', Number(maxVersion) + 1, '十步投标流水线',
+      '解析 → 知识检索 → 格式提取 → 要求确认 → 四类审查 → 法规/案例 → 技术/商务并行 → 一致性 → 质量门禁 → 终审 → 汇总 → 导出',
+      jstr(FALLBACK_PLAN), jstr({ parallelism: 2, max_budget: FALLBACK_PLAN.budget }), 1, now,
+    );
+  }
+  return { agentsAdded: added, workflowUpgraded: upgraded };
 }
 

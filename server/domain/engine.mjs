@@ -4,7 +4,7 @@ import { all, get, run, tx, jparse, jstr } from '../db.mjs';
 import { id, nowIso, sha256, clip } from '../lib/util.mjs';
 import { publish } from '../lib/bus.mjs';
 import { planRun, replan as replanPlan, reworkTargets, planDigest } from './planner.mjs';
-import { AGENT_HANDLERS } from './agents.mjs';
+import { AGENT_HANDLERS, agentRuntime } from './agents.mjs';
 import { evaluateQuality, normalizeQualityConfig } from './quality.mjs';
 import { openGate } from './review.mjs';
 import { loadSettings } from '../seed.mjs';
@@ -240,7 +240,8 @@ export class Engine {
   }
 
   claim(nodeId) {
-    const lease = new Date(Date.now() + 45000).toISOString();
+    const leaseSeconds = Number(loadSettings().workflow?.leaseSeconds ?? 45);
+    const lease = new Date(Date.now() + leaseSeconds * 1000).toISOString();
     const res = run("UPDATE node_runs SET status='running', lease_owner=?, lease_expires_at=?, started_at=COALESCE(started_at, ?), updated_at=? WHERE id=? AND status='ready'",
       `pid-${process.pid}`, lease, nowIso(), nowIso(), nodeId);
     return res.changes > 0;
@@ -291,8 +292,28 @@ export class Engine {
     const feedback = jparse(node.output_json, {})?.review_feedback ?? null;
     const params = { ...(spec.params || {}), ...(jparse(node.input_json, {})?.params || {}) };
 
+    // 心跳续租：模型逐章生成可能几分钟，租约只有几十秒，不续约会被对账当成失联节点反复重启
+    const leaseSeconds = Number(loadSettings().workflow?.leaseSeconds ?? 45);
+    const heartbeat = setInterval(() => {
+      try {
+        run("UPDATE node_runs SET lease_expires_at=? WHERE id=? AND status='running'",
+          new Date(Date.now() + leaseSeconds * 1000).toISOString(), node.id);
+      } catch { /* 心跳失败不影响主流程 */ }
+    }, Math.max(5, Math.floor(leaseSeconds / 3)) * 1000);
+    heartbeat.unref?.();
+
     try {
       if (node.node_type === 'human-review') {
+        // 幂等：同一个门禁已经有 pending 任务时直接复用，避免并发 tick 打开两条一样的待办
+        const existing = get(
+          "SELECT * FROM review_tasks WHERE run_id = ? AND gate_key = ? AND status = 'pending' ORDER BY created_at DESC LIMIT 1",
+          runId, nodeKey,
+        );
+        if (existing) {
+          run("UPDATE node_runs SET status='waiting_human', lease_owner=NULL, lease_expires_at=NULL, updated_at=? WHERE id=?", nowIso(), node.id);
+          run("UPDATE runs SET status='waiting_human', updated_at=? WHERE id=?", nowIso(), runId);
+          return;
+        }
         const gateRef = this.gateArtifact(runId, nodeKey);
         const opened = openGate({
           run: runRow, node, gateKey: nodeKey, policyKey: spec.review_policy_key || 'single', priority: 0,
@@ -314,6 +335,14 @@ export class Engine {
       const handler = AGENT_HANDLERS[spec.agent_key] || AGENT_HANDLERS[node.agent_key];
       if (!handler) throw new Error(`未注册的 Agent：${spec.agent_key || node.agent_key}`);
 
+      // Agent 接线：每次执行都从 agents 表取最新配置（提示词 / 档位 / 工具 / 启停）
+      const agent = agentRuntime(spec.agent_key || node.agent_key);
+      if (!agent.enabled) throw new Error(`Agent「${agent.name}」已停用，请先在「Agent 团队」启用后再运行`);
+      this.emit(runId, 'node.log', {
+        node_key: nodeKey,
+        message: `Agent「${agent.name}」· 档位 ${agent.tier} · 提示词 ${agent.prompt.length} 字 · 工具 ${agent.tools.length} 个`,
+      });
+
       // 演示/演示故障注入：模拟 Agent 耗时，便于观察并行与崩溃恢复
       const delayMs = Number(process.env.BIDCORE_AGENT_DELAY_MS || 0);
       if (delayMs > 0) await new Promise((resolve) => setTimeout(resolve, delayMs));
@@ -325,13 +354,15 @@ export class Engine {
       }
 
       const started = Date.now();
-      const result = await handler({ run: runRow, project, node, params, artifacts, feedback, iteration: node.iteration });
+      const result = await handler({ run: runRow, project, node, params, artifacts, feedback, iteration: node.iteration, agent });
       const drafts = (result.artifacts || []).map((a) => ({ ...a, provenance: { ...(a.provenance || {}), agent: node.agent_key, iteration: node.iteration, attempt: node.attempt } }));
       const metrics = { ...(result.metrics || {}), wall_ms: Date.now() - started };
       this.succeedNode(runId, node, drafts, metrics, result.log || []);
       for (const line of result.log || []) this.emit(runId, 'node.log', { node_key: nodeKey, message: line });
     } catch (error) {
       await this.failNode(runId, nodeKey, error);
+    } finally {
+      clearInterval(heartbeat);
     }
   }
 
@@ -409,7 +440,7 @@ export class Engine {
         jstr({ review_feedback: { action: 'quality-revise', comment: `质量返工：${evaluation.summary.top_issues.join('；')}`, edits: [], targets } }),
         nowIso(), target.id);
     }
-    this.invalidateDownstream(runId, targetKeys, node.node_key);
+    this.invalidateDownstream(runId, targetKeys, node.node_key, { keepGates: true });
     // 关键：评估节点自身回到 invalidated（清租约），等目标重跑成功后由 promoteReady 推回 ready 再次评估
     run("UPDATE node_runs SET status='invalidated', lease_owner=NULL, lease_expires_at=NULL, updated_at=? WHERE id=?", nowIso(), node.id);
     this.planRevise(runId, evaluation.findings, targetKeys);
@@ -548,8 +579,12 @@ export class Engine {
     this.emit(runId, 'node.failed', { node_key: nodeKey, error: message });
   }
 
-  /** 下游失效（不删除产物，保留版本用于对比） */
-  invalidateDownstream(runId, fromKeys, exceptNodeKey) {
+  /**
+   * 下游失效（不删除产物，保留版本用于对比）。
+   * keepGates=true 时跳过人工闸门：质量返工只重做内容，不推翻人已经做过的确认；
+   * 而人工裁决（modify/reanalyze）要连闸门一起失效，好让审核人重新确认。
+   */
+  invalidateDownstream(runId, fromKeys, exceptNodeKey, { keepGates = false } = {}) {
     const nodes = all('SELECT * FROM node_runs WHERE run_id = ?', runId);
     const affected = new Set();
     const queue = [...fromKeys];
@@ -564,6 +599,9 @@ export class Engine {
     let count = 0;
     for (const key of affected) {
       const node = nodes.find((n) => n.node_key === key);
+      // 人工闸门不参与质量返工的失效：返工的是内容，不是“人对要求的确认结论”，
+      // 否则每次质量返工都会把已通过的门禁重新打开，流程永远走不完。
+      if (keepGates && node?.node_type === 'human-review') continue;
       if (!['succeeded', 'waiting_human', 'invalidated'].includes(node.status)) continue;
       run("UPDATE node_runs SET status='invalidated', lease_owner=NULL, lease_expires_at=NULL, updated_at=? WHERE id=?", nowIso(), node.id);
       count += 1;

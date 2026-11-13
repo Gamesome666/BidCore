@@ -87,7 +87,15 @@ function esc(text) {
 
 function paragraph(text, style) {
   const pPr = style ? `<w:pPr><w:pStyle w:val="${style}"/></w:pPr>` : '';
-  return `<w:p>${pPr}<w:r><w:t xml:space="preserve">${esc(text)}</w:t></w:r></w:p>`;
+  // 行内 **加粗** → 多个 run；其余按普通文本
+  const parts = String(text).split(/(\*\*[^*]+\*\*)/g).filter(Boolean);
+  const runs = parts.map((part) => {
+    if (/^\*\*[^*]+\*\*$/.test(part)) {
+      return `<w:r><w:rPr><w:b/></w:rPr><w:t xml:space="preserve">${esc(part.slice(2, -2))}</w:t></w:r>`;
+    }
+    return `<w:r><w:t xml:space="preserve">${esc(part)}</w:t></w:r>`;
+  }).join('');
+  return `<w:p>${pPr}${runs}</w:p>`;
 }
 
 function pageBreak() {
@@ -156,10 +164,15 @@ export function markdownToDocx(markdown, meta = {}) {
       continue;
     }
 
-    if (line.startsWith('### ')) body.push(paragraph(line.slice(4), 'Heading3'));
-    else if (line.startsWith('## ')) body.push(paragraph(line.slice(3), 'Heading2'));
-    else if (line.startsWith('# ')) body.push(paragraph(line.slice(2), 'Heading1'));
-    else if (/^[-*]\s+/.test(line)) body.push(paragraph(`• ${line.replace(/^[-*]\s+/, '')}`));
+    // 标题：# / ## / ### / #### 都转成对应级别，避免 Markdown 井号出现在 Word 里
+    const headingMatch = /^(#{1,6})\s+(.*)$/.exec(line);
+    if (headingMatch) {
+      const level = headingMatch[1].length;
+      const style = level === 1 ? 'Heading1' : level === 2 ? 'Heading2' : level === 3 ? 'Heading3' : 'Heading4';
+      body.push(paragraph(headingMatch[2], style));
+      continue;
+    }
+    if (/^[-*]\s+/.test(line)) body.push(paragraph(`• ${line.replace(/^[-*]\s+/, '')}`));
     else body.push(paragraph(line));
   }
 
@@ -176,6 +189,7 @@ export function markdownToDocx(markdown, meta = {}) {
 <w:style w:type="paragraph" w:styleId="Heading1"><w:name w:val="heading 1"/><w:basedOn w:val="Normal"/><w:pPr><w:spacing w:before="360" w:after="200"/></w:pPr><w:rPr><w:b/><w:sz w:val="36"/><w:rFonts w:eastAsia="黑体"/></w:rPr></w:style>
 <w:style w:type="paragraph" w:styleId="Heading2"><w:name w:val="heading 2"/><w:basedOn w:val="Normal"/><w:pPr><w:spacing w:before="280" w:after="160"/></w:pPr><w:rPr><w:b/><w:sz w:val="28"/><w:rFonts w:eastAsia="黑体"/></w:rPr></w:style>
 <w:style w:type="paragraph" w:styleId="Heading3"><w:name w:val="heading 3"/><w:basedOn w:val="Normal"/><w:rPr><w:b/><w:sz w:val="24"/></w:rPr></w:style>
+<w:style w:type="paragraph" w:styleId="Heading4"><w:name w:val="heading 4"/><w:basedOn w:val="Normal"/><w:rPr><w:b/><w:sz w:val="22"/><w:rFonts w:eastAsia="黑体"/></w:rPr></w:style>
 </w:styles>`;
 
   const core = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>

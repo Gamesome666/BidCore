@@ -39,6 +39,25 @@ async function request(method, path, body, opts = {}) {
   return data;
 }
 
+/**
+ * multipart 上传：绝不能复用 request()。
+ * 浏览器必须自己生成 Content-Type 里的 boundary，所以这里只带 Authorization，
+ * 手动设置 'multipart/form-data' 会导致后端拿不到 boundary。
+ */
+async function uploadRequest(path, formData) {
+  const headers = {};
+  if (store.token) headers.Authorization = `Bearer ${store.token}`;
+  if (store.projectId) headers['X-Project-Id'] = String(store.projectId);
+  const res = await fetch(path, { method: 'POST', headers, body: formData });
+  const type = res.headers.get('content-type') || '';
+  const data = type.includes('application/json') ? await res.json() : await res.text();
+  if (!res.ok) {
+    if (res.status === 401) { store.token = ''; location.hash = '#/login'; }
+    throw new ApiError(res.status, data?.code, data?.error);
+  }
+  return data;
+}
+
 const qs = (q) => (q && Object.keys(q).length ? `?${new URLSearchParams(q)}` : '');
 
 export const api = {
@@ -58,7 +77,24 @@ export const api = {
   project: (id) => request('GET', `/api/projects/${id}`),
   createProject: (body) => request('POST', '/api/projects', body),
   updateProject: (id, body) => request('PUT', `/api/projects/${id}`, body),
+  deleteProject: (id) => request('DELETE', `/api/projects/${id}`),
+  deletionPreview: (id) => request('GET', `/api/projects/${id}/deletion-preview`),
   tender: (id) => request('GET', `/api/projects/${id}/tender`),
+  /** 招标文件上传：multipart；autoParse=0 让前端接着跑 parse 步骤（有进度条） */
+  uploadTender: (id, file) => {
+    const form = new FormData();
+    form.append('file', file);
+    form.append('autoParse', '0');
+    return uploadRequest(`/api/projects/${id}/tender/upload`, form);
+  },
+  /** 只解析不落库：新建项目弹窗「从文件导入」用 */
+  parseTenderFile: (file) => {
+    const form = new FormData();
+    form.append('file', file);
+    return uploadRequest('/api/tender/parse', form);
+  },
+  /** 粘贴招标正文（扫描件 OCR 后的兜底） */
+  saveTenderText: (id, text, name) => request('POST', `/api/projects/${id}/tender/text`, { text, name, autoParse: 0 }),
   workspace: (id) => request('GET', `/api/projects/${id}/workspace`),
 
   /* 技术方案（对标 yibiao） */
@@ -112,8 +148,17 @@ export const api = {
 
   /* 资产 / 团队 / 编排 */
   knowledge: (library) => request('GET', `/api/knowledge${library ? `?library=${library}` : ''}`),
+  knowledgeOne: (id) => request('GET', `/api/knowledge/${id}`),
   saveKnowledge: (doc) => (doc.id ? request('PUT', `/api/knowledge/${doc.id}`, doc) : request('POST', '/api/knowledge', doc)),
   deleteKnowledge: (id) => request('DELETE', `/api/knowledge/${id}`),
+  // 文件上传：FormData 必须走独立请求（见 uploadRequest 注释）
+  uploadKnowledge: (formData) => uploadRequest('/api/knowledge/upload', formData),
+  appendKnowledgeFiles: (id, formData) => uploadRequest(`/api/knowledge/${id}/files`, formData),
+  reparseKnowledge: (id) => request('POST', `/api/knowledge/${id}/reparse`, {}),
+  deleteKnowledgeFile: (id, fileId) => request('DELETE', `/api/knowledge/${id}/files/${encodeURIComponent(fileId)}`),
+  // <img>/<iframe>/<a download> 不会带 Authorization，统一用 ?token=
+  knowledgeFileUrl: (id, fileId, { download = false } = {}) =>
+    `/api/knowledge/${encodeURIComponent(id)}/files/${encodeURIComponent(fileId)}?token=${encodeURIComponent(store.token)}${download ? '&download=1' : ''}`,
   agents: () => request('GET', '/api/agents'),
   saveAgent: (id, body) => request('PUT', `/api/agents/${id}`, body),
   workflowDefs: () => request('GET', '/api/workflow-defs'),

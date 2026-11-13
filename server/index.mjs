@@ -5,7 +5,7 @@ import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { seed } from './seed.mjs';
+import { seed, ensureCatalog } from './seed.mjs';
 import { router, startBackgroundLoops } from './api.mjs';
 import { engine } from './domain/engine.mjs';
 import { parseUrl, sendJson, sendError } from './lib/http.mjs';
@@ -31,6 +31,7 @@ const MIME = {
 };
 
 const boot = seed();
+const catalog = ensureCatalog();
 
 function serveStatic(req, res, pathname) {
   const rel = pathname === '/' ? 'index.html' : pathname.replace(/^\/+/, '');
@@ -91,6 +92,9 @@ server.listen(PORT, HOST, () => {
   console.log(`  模型    ${process.env.LLM_MODE === 'openai' ? `${process.env.LLM_MODEL || 'deepseek-v4.1-flash'} @ opencode 网关` : '确定性 Mock（离线可用）'}`);
   console.log(`  账号    admin/admin123 · owner/owner123 · tech/tech123 · biz/biz123 · reviewer/reviewer123`);
   console.log(`  种子    ${boot.seeded ? '已初始化演示数据' : '复用现有数据（npm run reset 可重置）'}`);
+  if (catalog.agentsAdded?.length || catalog.workflowUpgraded) {
+    console.log(`  升级    Agent +${catalog.agentsAdded?.length || 0}（${catalog.agentsAdded?.join(',') || '无'}）${catalog.workflowUpgraded ? ' / 工作流已升级为十步流水线' : ''}`);
+  }
   console.log('');
 });
 
