@@ -18,6 +18,34 @@ export function clip(text, n = 400) {
   return s.length > n ? `${s.slice(0, n)}…` : s;
 }
 
+/** 清洗为合法文件名：去掉 Windows 非法字符、控制符与首尾空白/点号，压掉连续空白 */
+export function safeFileName(name, fallback = '投标文件') {
+  const clean = String(name ?? '')
+    .replace(/[\\/:*?"<>|\x00-\x1f]/g, '')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .replace(/^[.\s]+|[.\s]+$/g, '');
+  if (!clean) return fallback;
+  return clean.length > 80 ? `${clean.slice(0, 80)}…` : clean;
+}
+
+/**
+ * 同项目重名时追加数字后缀：项目名.docx → 项目名-2.docx → 项目名-3.docx。
+ * taken 为已占用的完整文件名集合（不含路径）。
+ */
+export function resolveUniqueFileName(baseName, ext, taken = []) {
+  const used = new Set(taken.map((f) => String(f || '')));
+  const stem = safeFileName(baseName);
+  let candidate = `${stem}${ext}`;
+  if (!used.has(candidate)) return candidate;
+  let n = 2;
+  do {
+    candidate = `${stem}-${n}${ext}`;
+    n += 1;
+  } while (used.has(candidate));
+  return candidate;
+}
+
 export function hashPassword(password, salt = crypto.randomBytes(8).toString('hex')) {
   const hash = crypto.scryptSync(String(password), salt, 32).toString('hex');
   return `${salt}:${hash}`;

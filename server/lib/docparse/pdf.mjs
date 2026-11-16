@@ -197,7 +197,7 @@ function scanObjects(buf) {
     const num = Number(match[1]);
     const bodyStart = match.index + match[0].length;
     const endobj = src.indexOf('endobj', bodyStart);
-    const streamKeyword = /(?:^|[\r\n\s])stream[\r\n]/.exec(src.slice(bodyStart, endobj > 0 ? endobj : bodyStart + 4_000_000));
+    const streamKeyword = /(?:^|[\r\n\s>])stream(?:\r\n|\n\r|\r|\n)/.exec(src.slice(bodyStart, endobj > 0 ? endobj : bodyStart + 4_000_000));
     if (streamKeyword && endobj >= 0) {
       const streamMark = bodyStart + streamKeyword.index + streamKeyword[0].indexOf('stream');
       let dataStart = streamMark + 'stream'.length;
@@ -226,6 +226,7 @@ function scanObjects(buf) {
     objects.set(num, {
       num,
       dict: dict.type === 'dict' ? dict : { type: 'dict', entries: new Map() },
+      raw: dict,
       stream: null,
     });
     re.lastIndex = endobj + 6;
@@ -268,7 +269,9 @@ const resolve = (objects, node, depth = 0) => {
   if (!node || depth > 8) return null;
   if (node.type === 'ref') {
     const obj = objects.get(node.num);
-    return obj ? resolve(objects, obj.dict, depth + 1) : null;
+    if (!obj) return null;
+    if (obj.dict?.type === 'dict' && obj.dict.entries.size) return resolve(objects, obj.dict, depth + 1);
+    return obj.raw ?? obj.dict;
   }
   return node;
 };
@@ -358,13 +361,15 @@ function buildFontMaps(objects, resources) {
     let dw = 1000;
     if (isType0) {
       const descendants = resolve(objects, font.entries.get('DescendantFonts'));
-      const cidFont = resolve(objects, descendants?.type === 'array' ? descendants.items[0] : descendants);
+      const descNode = descendants?.type === 'ref' ? resolve(objects, descendants) : descendants;
+      const cidFont = resolve(objects, descNode?.type === 'array' ? descNode.items[0] : descNode);
       if (cidFont?.type === 'dict') {
         dw = Number(cidFont.entries.get('DW')?.value ?? 1000);
         const w = cidFont.entries.get('W');
-        if (w?.type === 'array') {
+        const wNode = w?.type === 'ref' ? resolve(objects, w) : w;
+        if (wNode?.type === 'array') {
           widths = new Map();
-          const items = w.items;
+          const items = wNode.items;
           for (let i = 0; i < items.length; i += 1) {
             const first = items[i];
             if (first?.type !== 'number') continue;
@@ -430,10 +435,16 @@ function extractContentText(content, fonts) {
   let lastX = null;
   let lastY = null;
   let prevWidth = 1;
+  // 描边/填充双层渲染：同一坐标重复绘制同一字形时只保留一次
+  let lastSpan = { x: null, y: null, text: '' };
   const newline = () => { if (out && !/\n$/.test(out)) out += '\n'; };
   const widthOf = (code) => (font.widths?.get(code) ?? font.dw ?? 1000) / 1000;
   const emit = (decoded) => {
     if (!decoded?.text) return;
+    // 描边/填充双层渲染：相邻两次绘制坐标几乎相同且文本相同（或为其单字重复）时，跳过后一层
+    const cx = lastX, cy = lastY;
+    const sameSpot = lastSpan.x !== null && Math.abs(cx - lastSpan.x) < 3 && Math.abs(cy - lastSpan.y) < 3;
+    if (sameSpot && decoded.text && decoded.text === lastSpan.text) return;
     if (move.fresh) {
       if (fontSize > 0 && Math.abs(move.dx) > 0.01 && move.dx / fontSize > prevWidth + 0.15) pendingSpace = true;
       move.fresh = false;
@@ -442,6 +453,7 @@ function extractContentText(content, fonts) {
     if (pendingSpace && out && !/\s$/.test(out) && isLatin(out.slice(-1) + decoded.text[0])) out += ' ';
     pendingSpace = false;
     out += decoded.text;
+    lastSpan = { x: cx, y: cy, text: decoded.text };
   };
 
   for (let guard = 0; guard < 500000; guard += 1) {
@@ -503,10 +515,12 @@ function extractContentText(content, fonts) {
       const x = numbers[4]?.value;
       const y = numbers[5]?.value;
       if (Number.isFinite(x) && Number.isFinite(y)) {
-        if (lastY !== null && Math.abs(y - lastY) > 0.5) newline();
+        const lineBreak = lastY !== null && Math.abs(y - lastY) > 5;
+        if (lineBreak) newline();
         move = { dx: lastX === null ? 0 : x - lastX, fresh: true };
         lastX = x;
         lastY = y;
+        if (lineBreak) lastSpan = { x: null, y: null, text: '' };
       }
     } else if (op === 'ET') {
       // 文本对象结束：不强制换行，交给 Td/Tm 判断

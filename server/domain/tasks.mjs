@@ -11,9 +11,10 @@ import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { all, get, run, tx, jparse, jstr, VAR_DIR } from '../db.mjs';
-import { id, nowIso, clip, sha256 } from '../lib/util.mjs';
+import { id, nowIso, clip, sha256, resolveUniqueFileName } from '../lib/util.mjs';
 import { publish } from '../lib/bus.mjs';
 import { writeDocx } from './docx.mjs';
+import { parseLayoutSpec } from './layout.mjs';
 import { loadSettings } from '../seed.mjs';
 import { generateText, llmStatus } from './llm.mjs';
 import {
@@ -539,9 +540,33 @@ async function runDeviation(projectId, taskId, options = {}) {
   return { stats: deviation.summary, log: `偏离表生成：${deviation.rows.length} 行，等待人工确认` };
 }
 
-function exportFileName(projectId) {
-  const stamp = new Date().toISOString().replace(/[-:T.Z]/g, '').slice(0, 14);
-  return `bidcore-p${projectId}-${stamp}.docx`;
+/** 收集同项目已占用的导出文件名：exports 表 + artifacts 产物 + 磁盘 files 目录 */
+function takenExportNames(projectId) {
+  const taken = new Set(
+    all('SELECT file_name FROM exports WHERE project_id=?', projectId).map((row) => row.file_name),
+  );
+  const runIds = all('SELECT id FROM runs WHERE project_id=?', projectId).map((row) => row.id);
+  for (const runId of runIds) {
+    for (const row of all("SELECT storage_path, payload_json FROM artifacts WHERE run_id=? AND kind='doc.docx'", runId)) {
+      const stored = row.storage_path ? path.basename(row.storage_path) : '';
+      if (stored) taken.add(stored);
+      const payload = jparse(row.payload_json, null);
+      const fromPayload = String(payload?.file || '').split('/').filter(Boolean).pop();
+      if (fromPayload) taken.add(fromPayload);
+    }
+  }
+  const filesDir = path.join(VAR_DIR, 'files');
+  if (fs.existsSync(filesDir)) {
+    for (const entry of fs.readdirSync(filesDir)) {
+      if (entry.endsWith('.docx')) taken.add(entry);
+    }
+  }
+  return [...taken];
+}
+
+/** 导出文件名：以项目名为准；同项目重名时追加 -2 / -3 数字后缀 */
+function exportFileName(projectId, projectName) {
+  return resolveUniqueFileName(projectName, '.docx', takenExportNames(projectId));
 }
 
 /** 导出（校验 → 渲染 → 落盘 → 记档）；返回 { ok, validation, record } */
@@ -627,9 +652,13 @@ export function createProjectExport(projectId, user = null) {
   });
 
   const markdown = composeProjectMarkdown({ project, state: stateWithPack, extras: { qualificationMarkdown: pack.markdown } });
-  const fileName = exportFileName(projectId);
+  const fileName = exportFileName(projectId, project.name);
   const filePath = path.join(VAR_DIR, 'files', fileName);
-  const { size } = writeDocx(filePath, markdown, { title: `${project.name} 技术方案`, author: project.bidder_name || 'BidCore' });
+  const { size } = writeDocx(filePath, markdown, {
+    title: `${project.name} 技术方案`,
+    author: project.bidder_name || '',
+    layout: parseLayoutSpec(project.tender_text),
+  });
   const buffer = fs.readFileSync(filePath);
   const digest = crypto.createHash('sha256').update(buffer).digest('hex');
   const exportId = id('exp');
@@ -1197,8 +1226,12 @@ export function exportProjectDocx(projectId) {
 
   const markdown = state.content?.markdown || composeProjectMarkdown({ project, state });
   const header = `# ${project.name}\n投标人：${project.bidder_name || '我方'}　采购编号：${state.bid_analysis?.project_meta?.code || project.code || '-'}\n\n`;
-  const file = `compat-${projectId}-${sha256(markdown).slice(0, 8)}.docx`;
+  const file = resolveUniqueFileName(project.name, '.docx', takenExportNames(projectId));
   const filePath = path.join(VAR_DIR, 'files', file);
-  const { size } = writeDocx(filePath, `${header}${markdown}`, { title: project.name, author: project.bidder_name });
-  return { file: `/files/${file}`, size, words: state.content?.total_words || 0 };
+  const { size } = writeDocx(filePath, `${header}${markdown}`, {
+    title: project.name,
+    author: project.bidder_name,
+    layout: parseLayoutSpec(project.tender_text),
+  });
+  return { file: `/files/${file}`, file_name: file, size, words: state.content?.total_words || 0 };
 }

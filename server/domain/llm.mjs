@@ -41,7 +41,7 @@ export function llmStatus() {
   };
 }
 
-async function callOpenAI(cfg, messages, { json = false, temperature, model, maxTokens } = {}) {
+async function callOpenAI(cfg, messages, { json = false, temperature, model, maxTokens, timeoutMs } = {}) {
   const url = `${String(cfg.base_url).replace(/\/$/, '')}/chat/completions`;
   const res = await fetch(url, {
     method: 'POST',
@@ -59,7 +59,7 @@ async function callOpenAI(cfg, messages, { json = false, temperature, model, max
       max_tokens: Number(maxTokens || cfg.max_tokens || 3000),
       ...(json ? { response_format: { type: 'json_object' } } : {}),
     }),
-    signal: AbortSignal.timeout(Number(cfg.timeout_ms || 90_000)),
+    signal: AbortSignal.timeout(Number(timeoutMs || cfg.timeout_ms || 90_000)),
   });
   if (!res.ok) throw new Error(`LLM HTTP ${res.status}: ${(await res.text()).slice(0, 200)}`);
   const data = await res.json();
@@ -220,7 +220,7 @@ export function llmEnabled() {
 }
 
 /** 通用文本生成：mock → 结构化拼装；openai → 真实调用（支持按 Agent 档位选模型） */
-export async function generateText({ system, user, fallback, tier = 'standard', maxTokens }) {
+export async function generateText({ system, user, fallback, tier = 'standard', maxTokens, timeoutMs }) {
   const cfg = getLlmConfig();
   if (cfg.mode !== 'openai' || !cfg.base_url || !cfg.api_key) {
     return fallback ?? mockProse({ heading: '本项工作' });
@@ -229,7 +229,7 @@ export async function generateText({ system, user, fallback, tier = 'standard', 
     return await callOpenAI(cfg, [
       { role: 'system', content: system || '你是中文投标文件写作专家，输出严谨、可核验的技术标内容。' },
       { role: 'user', content: user },
-    ], { model: modelForTier(tier), maxTokens });
+    ], { model: modelForTier(tier), maxTokens, timeoutMs });
   } catch (error) {
     // 真实模型失败时降级到 mock，保证工作流不中断（并在事件里可见）
     return `${fallback ?? mockProse({ heading: '本项工作' })}\n\n<!-- LLM_FALLBACK: ${String(error.message).slice(0, 120)} -->`;

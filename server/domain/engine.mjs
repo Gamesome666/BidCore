@@ -407,10 +407,16 @@ export class Engine {
     }
 
     const maxIterations = Number(qualityConfig.max_iterations ?? 3);
-    const forceHuman = evaluation.verdict === 'veto' || iteration >= maxIterations;
+    // 资料缺失类 blocking（MAT-*，资质/业绩/证书）靠写正文补不出来，
+    // 返工只会空转烧时间（每轮都要重跑一遍 tech 的逐章模型调用），因此直接转人工补资料。
+    const blockingRules = (evaluation.findings || [])
+      .filter((f) => f.severity === 'blocking')
+      .map((f) => String(f.rule || ''));
+    const onlyMaterialGap = blockingRules.length > 0 && blockingRules.every((r) => r.startsWith('MAT-'));
+    const forceHuman = evaluation.verdict === 'veto' || iteration >= maxIterations || onlyMaterialGap;
 
     if (forceHuman) {
-      // 熔断或 veto：不自动烧钱，直接转人工
+      // 熔断、veto 或只剩资料缺口：不自动烧钱，直接转人工
       const opened = openGate({
         run: runRow, node, gateKey: node.node_key, policyKey: 'single',
         priority: evaluation.verdict === 'veto' ? 1 : 0,
@@ -420,7 +426,9 @@ export class Engine {
       run("UPDATE runs SET status='waiting_human', updated_at=? WHERE id=?", nowIso(), runId);
       this.emit(runId, 'gate.opened', {
         node_key: node.node_key, review_task_id: opened.reviewTaskId, level: 1,
-        reason: evaluation.verdict === 'veto' ? '存在未响应的废标条款' : `质量未达标且已达迭代上限（${maxIterations}）`,
+        reason: evaluation.verdict === 'veto' ? '存在未响应的废标条款'
+          : onlyMaterialGap ? '仅剩企业资料缺口（MAT 类），写正文无法补齐，已转人工补资料'
+            : `质量未达标且已达迭代上限（${maxIterations}）`,
       });
       return;
     }

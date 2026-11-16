@@ -178,7 +178,7 @@ export function reworkTargets(findings) {
     if (f.rule === 'ACC-01' || f.rule === 'ACC-02' || f.rule === 'ACC-03' || f.rule === 'DOC-03') { targets.add('tech'); reasons.push('内容准确性/篇幅问题'); }
     if (f.rule === 'REQ-03') { targets.add('tech'); reasons.push('量化指标缺失'); }
     if (f.rule === 'VETO') { targets.add('compliance'); reasons.push('废标条款未响应'); }
-    if (f.rule === 'DOC-01' || f.rule === 'DOC-02') { targets.add('doc'); reasons.push('文档规范性问题'); }
+    if (f.rule === 'DOC-01' || f.rule === 'DOC-02' || f.rule === 'DOC-04') { targets.add('doc'); reasons.push('文档规范性问题'); }
   }
   if (targets.has('knowledge')) targets.add('tech');
   return { targets: [...targets], reasons: [...new Set(reasons)] };
