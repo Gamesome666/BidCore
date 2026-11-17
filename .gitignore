@@ -32,8 +32,19 @@ yarn-error.log*
 *.orig
 *.rej
 
-# ── 非本项目内容的本地残留（TTS 试验等），不入库
-/demo/
+# ── 演示录制工作区（只保留 storyboard / 脚本；成品在 docs/video）
+/demo/.chrome-profile*/
+/demo/recordings/
+/demo/frames/
+/demo/final-frames/
+/demo/output/
+/demo/audio/
+/demo/logs/
+/demo/srv.*
+/demo/tts.*
+
+# ── 演示视频成品（体积大，不入库；需要时挂 Release Assets 后从 README 外链）
+/docs/video/
 
 # ── 编辑器 / 操作系统
 .vscode/
