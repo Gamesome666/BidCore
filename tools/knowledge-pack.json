@@ -40,12 +40,12 @@
       "library": "company"
     },
     {
-      "title": "安全生产许可证（旧版，已过期）",
+      "title": "安全生产许可证（旧版存档，已作废）",
       "folder": "公司资质",
       "category": "qualification",
       "content": "旧版安全生产许可证，证书编号 AQ-2021-0099，有效期至 2024-12-31，已换证（新证待归档）。",
-      "tags": "安全,过期,待更新",
-      "expires_at": "2028-12-31",
+      "tags": "安全,过期,待更新,作废存档",
+      "expires_at": "",
       "library": "company"
     },
     {
