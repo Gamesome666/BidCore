@@ -72,6 +72,19 @@ node server/index.mjs            # 等价 npm start
 | 冒烟测试 | `node server/smoke.mjs`（`npm run smoke`） |
 | 演示数据 | `node tools/demo.mjs` |
 
+### 导入知识库演示数据包
+
+仓库自带 `tools/knowledge-pack.json`（27 篇：资质、业绩、财务、授权函等样例），服务启动后执行一次即可导入，让「资质命中 MAT-01」不再是缺口：
+
+```bash
+node tools/import-knowledge.mjs          # 默认 http://127.0.0.1:5192，admin/admin123
+node tools/import-knowledge.mjs --base http://127.0.0.1:5197 --user admin --pass xxx
+```
+
+导入脚本只新增库中不存在的同名文档，重复执行安全；数据包内不含任何密钥。
+
+> 不导入也能跑通流程，但空知识库下 `MAT-01` 会判为阻塞（命中不足），质量分封顶 79 并转人工补资料 —— 这是设计预期，不是故障。
+
 ### 演示账号
 
 | 账号 | 密码 | 角色 |

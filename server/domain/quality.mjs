@@ -2,6 +2,8 @@
 // 14 条规则、5 维度、加权 30/25/20/15/10；veto 直接封顶 59 并强制人工。
 import { all, get } from '../db.mjs';
 import { splitSentences, jaccard, shingles, clip, nowIso } from '../lib/util.mjs';
+import { auditDocument } from './docx-audit.mjs';
+import { layoutFromFormat } from './layout.mjs';
 
 export const DIMENSIONS = {
   requirement_coverage: { label: '招标要求响应完整度', weight: 30 },
@@ -117,9 +119,10 @@ const RULE_META = {
   'MAT-01': { dimension: 'material_match', weight: 0.6, label: '资质/业绩命中' },
   'MAT-02': { dimension: 'material_match', weight: 0.2, label: '证书有效期' },
   'MAT-03': { dimension: 'material_match', weight: 0.2, label: '知识库引用占比' },
-  'DOC-01': { dimension: 'documentation', weight: 0.3, label: '编号与层级规范' },
-  'DOC-02': { dimension: 'documentation', weight: 0.3, label: '导出必填完整' },
-  'DOC-03': { dimension: 'documentation', weight: 0.4, label: '章节篇幅达标' },
+  'DOC-01': { dimension: 'documentation', weight: 0.2, label: '编号与层级规范' },
+  'DOC-02': { dimension: 'documentation', weight: 0.2, label: '导出必填完整' },
+  'DOC-03': { dimension: 'documentation', weight: 0.3, label: '章节篇幅达标' },
+  'DOC-04': { dimension: 'documentation', weight: 0.3, label: '版式与元数据规范' },
 };
 
 const PLACEHOLDER = /(待补充|待确认|待填写|TODO|TBD|XXX|xx%|【\s*】|＿{2,})/g;
@@ -154,6 +157,7 @@ export function runRules({ project, artifacts, config }) {
   const commercial = artifacts['commercial.pack'];
   const compliance = artifacts['compliance.report'];
   const dup = artifacts['compliance.duplicate'];
+  const format = artifacts['tender.format'];
   const findings = [];
   const cfg = normalizeQualityConfig(config);
   const thresholds = cfg.thresholds;
@@ -412,6 +416,19 @@ export function runRules({ project, artifacts, config }) {
       sections.filter((s) => s.words < minWords).slice(0, 6).map((s) => ({ type: 'section', ref: s.id, excerpt: `${s.title} ${s.words} 字` })),
       { target_agents: ok.length < sections.length ? ['tech'] : [] }));
   } else findings.push(skip('DOC-03', '缺少正文产物'));
+
+  // DOC-04 版式与元数据：拿「即将导出的那份正文」dry-run 生成一次 docx 并审计
+  // （层级跳级/字体字号/页边距/页码/表格表头/元数据），可被 doc 节点返工修好
+  if (content?.markdown) {
+    const expected = layoutFromFormat(format);
+    const audit = auditDocument({
+      markdown: content.markdown,
+      meta: { title: analysis?.project?.name || project?.name || '投标文件', author: project?.bidder_name || '' },
+      expected,
+    });
+    findings.push(finding('DOC-04', audit.score, audit.message, audit.evidence,
+      { target_agents: audit.score < 90 ? ['doc'] : [], audit_items: audit.items }));
+  } else findings.push(skip('DOC-04', '缺少正文产物'));
 
   // 否决项：合规未响应
   const vetoFindings = (compliance?.vetoes || []).filter((v) => !v.responded).map((v) => ({

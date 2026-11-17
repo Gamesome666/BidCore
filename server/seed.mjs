@@ -3,6 +3,8 @@
 import './lib/env.mjs';
 // 演示种子：2 个真实感招标项目 + 企业知识库（四库）+ 9 个 Agent + 默认 DAG + 三级审核策略 + 质量/模型配置。
 // 目标：评委解压即跑，且能演示「缺资质 → 返工」「废标 → 强制人工」「多级审核」「Self-Loop」全部路径。
+import { existsSync, readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 import { all, get, run, tx, jstr } from './db.mjs';
 import { id, nowIso, hashPassword } from './lib/util.mjs';
 
@@ -94,7 +96,7 @@ const KNOWLEDGE = [
   { library: 'company', title: 'ISO27001 信息安全管理体系认证证书', folder: '公司资质', category: 'qualification', file_name: 'ISO27001-2023.pdf', content: '智标科技有限公司通过 ISO/IEC 27001:2022 信息安全管理体系认证，覆盖云平台运维与数据处理服务，证书编号 CN-ISO27001-2023-1105，有效期至 2027-12-05。', tags: 'ISO27001,信息安全,资质', expires_at: '2027-12-05' },
   { library: 'company', title: 'CMMI 3 级评估证书', folder: '公司资质', category: 'qualification', file_name: 'CMMI3-2025.pdf', content: '智标科技有限公司通过 CMMI DEV 3 级评估，评估范围覆盖软件开发与运维服务交付过程，证书有效期至 2028-03-20。', tags: 'CMMI3,软件能力成熟度,资质', expires_at: '2028-03-20' },
   { library: 'company', title: 'ITSS 信息技术服务运行维护标准符合性证书（二级）', folder: '公司资质', category: 'qualification', file_name: 'ITSS-2-2025.pdf', content: '智标科技有限公司取得 ITSS 运行维护服务能力成熟度二级证书，证书编号 ITSS-2025-0231，有效期至 2027-05-30。', tags: 'ITSS,运维标准,资质', expires_at: '2027-05-30' },
-  { library: 'company', title: '安全生产许可证（旧版，已过期）', folder: '公司资质', category: 'qualification', file_name: 'safety-old.pdf', content: '旧版安全生产许可证，证书编号 AQ-2021-0099，有效期至 2024-12-31，已换证（新证待归档）。', tags: '安全,过期,待更新', expires_at: '2024-12-31' },
+  { library: 'company', title: '安全生产许可证（旧版存档，已作废）', folder: '公司资质', category: 'qualification', file_name: 'safety-old.pdf', content: '旧版安全生产许可证，证书编号 AQ-2021-0099，有效期至 2024-12-31，已换发新证，此件仅作历史存档，不参与有效期校验。', tags: '安全,作废存档' },
   { library: 'doc', title: 'XX市大数据局政务云运维服务项目（2024）', folder: '项目业绩', category: 'case', file_name: 'perf-zwy-2024.docx', content: '2024 年中标 XX市大数据局政务云运维服务项目，合同金额 268 万元，服务内容包含 7×24 值守、云平台巡检、故障处置与等保加固，年度可用性 99.95%，客户满意度 98%，验收结论优秀。', tags: '政务云,运维,业绩,7×24' },
   { library: 'doc', title: 'XX区数据共享平台运维项目（2023）', folder: '项目业绩', category: 'case', file_name: 'perf-data-2023.docx', content: '2023 年承接 XX区数据共享平台运维项目，合同金额 215 万元，提供驻场 3 人团队、数据库优化与安全加固服务，重大故障平均恢复时间 78 分钟。', tags: '数据平台,运维,业绩,驻场' },
   { library: 'doc', title: 'XX市医保云平台运维项目（2025）', folder: '项目业绩', category: 'case', file_name: 'perf-medical-2025.docx', content: '2025 年承接 XX市医保云平台运维项目，合同金额 236 万元，覆盖 7×24 值守、双活切换演练与等保测评整改，全年零重大事故。', tags: '医保云,业绩,双活' },
@@ -232,6 +234,41 @@ export function seed() {
       );
     }
   });
+
+  // 可选数据包：首次初始化时把 tools/knowledge-pack.json 一并灌入，做到「下载即带知识库」。
+  // 同名条目以数据包为准（校正有效期/分类），缺失的补齐；数据包纯文本，不含任何密钥。
+  try {
+    const packPath = fileURLToPath(new URL('../tools/knowledge-pack.json', import.meta.url));
+    if (existsSync(packPath)) {
+      const pack = JSON.parse(readFileSync(packPath, 'utf8'));
+      let added = 0;
+      let fixed = 0;
+      tx(() => {
+        for (const doc of pack.docs || []) {
+          const title = String(doc.title || '').trim();
+          if (!title) continue;
+          const existing = get('SELECT id FROM knowledge_docs WHERE title = ?', title);
+          if (existing) {
+            run(
+              'UPDATE knowledge_docs SET folder = ?, category = ?, tags = ?, expires_at = ? WHERE id = ?',
+              doc.folder || '', doc.category || '', doc.tags || '', doc.expires_at || null, existing.id,
+            );
+            fixed++;
+            continue;
+          }
+          run(
+            'INSERT INTO knowledge_docs (id, title, folder, category, content, tags, expires_at, created_at, library, file_name, meta_json) VALUES (?,?,?,?,?,?,?,?,?,?,?)',
+            id('kdoc'), title, doc.folder || '', doc.category || '', doc.content || '', doc.tags || '', doc.expires_at || null, now,
+            doc.library || 'company', '', jstr({ source: 'knowledge-pack', owner: '智标科技' }),
+          );
+          added++;
+        }
+      });
+      if (added || fixed) console.log(`[seed] 知识库数据包已处理：新增 ${added} 篇，校正 ${fixed} 篇`);
+    }
+  } catch (error) {
+    console.log(`[seed] 知识库数据包导入跳过：${error.message}`);
+  }
 
   tx(() => {
     AGENTS.forEach((a, i) => {

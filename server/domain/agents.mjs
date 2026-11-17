@@ -5,20 +5,51 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { all, get, jparse } from '../db.mjs';
 import { VAR_DIR } from '../db.mjs';
-import { clip, sha256 } from '../lib/util.mjs';
+import { clip, sha256, resolveUniqueFileName } from '../lib/util.mjs';
 import {
   parseTender, matchKnowledge, buildOutline, buildOutlineFromTender, deriveTechnicalFiles, writeContent, composeContentMarkdown,
-  buildCommercial, checkCompliance, duplicateReport, buildStrategy,
+  buildCommercial, checkCompliance, duplicateReport, buildStrategy, metricsResponseMarkdown,
 } from './bid.mjs';
 import { generateText, llmEnabled } from './llm.mjs';
 import { extractBidFormat, splitSections, tableRows, longestNumberedRun } from './tenderSections.mjs';
 import { writeDocx } from './docx.mjs';
+import { parseLayoutSpec, layoutFromFormat } from './layout.mjs';
 import { buildBidDocument, DEFAULT_BID_ITEMS } from './bidAssembly.mjs';
 import { buildQualificationPack } from './qualification.mjs';
 
 /** 所有 Agent 共享的写作底线：不许编造证书号、业绩金额、人员姓名 */
 const BASE_STYLE = '你是中文投标文件写作专家。只写招标文件与知识库支持的内容，不编造证书编号、合同金额、人员姓名；'
   + '输出 Markdown 正文，不要重复标题层级，不要解释写作过程，不要出现"待补充"以外的占位内容。';
+
+/**
+ * 模型偶尔会把「写作要求」这类提示词原文复读进正文（例如"不要写「待补充」；直接输出正文 Markdown"），
+ * 这些句子会污染投标文件、还会被 ACC-02 当成真实占位符，导致质量分永远封顶。
+ * 这里按段落/句子剔除指令特征句；注意「待补充」本身不当特征词，真实业务缺口仍会被质检抓出来。
+ */
+const INSTRUCTION_ECHO = [
+  /写作要求|不要出现|不要写|直接输出正文|分四个小节|小标题用\s*#|不要解释|请撰写|补足约|不要重复前文|只输出正文/,
+  /目标\s*\d+\s*字|不少于\s*\d+\s*字/,
+  /Avoid\s+"|placeholders|Write about|Please write|Write a (short|section)/i,
+];
+
+export function stripInstructionEcho(text) {
+  const source = String(text || '');
+  if (!source) return '';
+  const isEcho = (s) => INSTRUCTION_ECHO.some((re) => re.test(s));
+  const paragraphs = source.split(/\n{2,}/);
+  const kept = [];
+  for (const para of paragraphs) {
+    if (!isEcho(para)) { kept.push(para); continue; }
+    // 段落里混着指令：按句号切开逐句剔除，剩下的内容够长才保留
+    const sentences = para.split(/(?<=[。；！？!?])\s*/);
+    const rest = sentences.filter((s) => !isEcho(s)).join('').trim();
+    if (rest.replace(/\s/g, '').length >= 40) kept.push(rest);
+  }
+  const cleaned = kept.join('\n\n').trim();
+  // 清洗过头（掉到原文字数 30% 以下）说明误伤，回退原文
+  const ratio = cleaned.replace(/\s/g, '').length / Math.max(1, source.replace(/\s/g, '').length);
+  return ratio >= 0.3 ? cleaned : source.trim();
+}
 
 /**
  * 读取 Agent 运行时配置（Agent 团队页编辑的那份）。
@@ -52,7 +83,7 @@ function agentToolSet(agent) {
  * 用该节点的 Agent 配置写一段正文。
  * mock 模式或模型失败时返回 fallback（模板正文）——保证离线可复现、演示不中断。
  */
-async function agentText({ ctx, heading, points = [], numbers = [], refs = [], fallback, role, user: userOverride, maxTokens }) {
+async function agentText({ ctx, heading, points = [], numbers = [], refs = [], fallback, role, user: userOverride, maxTokens, timeoutMs }) {
   const agent = ctx.agent || {};
   const user = userOverride || [
     `章节：${heading}`,
@@ -67,6 +98,7 @@ async function agentText({ ctx, heading, points = [], numbers = [], refs = [], f
     fallback,
     tier: agent.tier || 'standard',
     maxTokens,
+    timeoutMs,
   });
   return { text, usedModel: text !== fallback && !String(text).includes('LLM_FALLBACK') };
 }
@@ -182,24 +214,32 @@ export async function techAgent(ctx) {
 
   // Agent 接线：真实模型逐章生成（每章按目标字数写满，不足则补写一次）；mock 模式沿用模板
   const tools = agentToolSet(ctx.agent);
-  const limit = Math.min(content.sections.length, Math.max(0, Number(process.env.BIDCORE_AGENT_LLM_SECTIONS || content.sections.length)));
+  const envSections = Number(process.env.BIDCORE_AGENT_LLM_SECTIONS || 0);
+  // 默认首轮前 6 章走模型，返工轮只让前 3 章重写（模板补强已覆盖指标，少绕一圈）
+  const defaultCap = iteration > 0 ? 3 : 6;
+  const limit = Math.min(content.sections.length, envSections > 0 ? envSections : defaultCap);
+  // 每批并发 N 章：串行总时长约降为 1/N（BIDCORE_AGENT_LLM_CONCURRENCY 可调）
+  const concurrency = Math.max(1, Number(process.env.BIDCORE_AGENT_LLM_CONCURRENCY || 3));
+  // 单章超时：卡住就快速回退模板，不再空等满 90 秒（BIDCORE_AGENT_LLM_TIMEOUT_MS 可调）
+  const chapterTimeoutMs = Math.max(10000, Number(process.env.BIDCORE_AGENT_LLM_TIMEOUT_MS || 45000));
   const byReq = new Map(analysis.requirements.map((r) => [r.id, r]));
   const targetOf = new Map(outline.sections.map((s) => [s.title, Number(s.target_words || 800)]));
   let rewritten = 0;
   const modelErrors = [];
   const modelOn = llmEnabled();
-  for (const section of content.sections.slice(0, limit)) {
+  const facts = [
+    ctx.project.name && `项目名称：${ctx.project.name}`,
+    analysis.project?.owner && `采购人：${analysis.project.owner}`,
+    analysis.project?.code && `采购编号：${analysis.project.code}`,
+    analysis.project?.duration && `服务期限：${analysis.project.duration}`,
+    analysis.project?.budget && `预算/限价：${analysis.project.budget}`,
+    `投标人：${bidder}`,
+  ].filter(Boolean).join('\n');
+
+  async function rewriteSection(section) {
+    if (!modelOn) return;
     const reqs = (section.refs?.requirements || []).map((rid) => byReq.get(rid)).filter(Boolean);
-    if (!modelOn) continue;
     const target = targetOf.get(section.title) || 800;
-    const facts = [
-      ctx.project.name && `项目名称：${ctx.project.name}`,
-      analysis.project?.owner && `采购人：${analysis.project.owner}`,
-      analysis.project?.code && `采购编号：${analysis.project.code}`,
-      analysis.project?.duration && `服务期限：${analysis.project.duration}`,
-      analysis.project?.budget && `预算/限价：${analysis.project.budget}`,
-      `投标人：${bidder}`,
-    ].filter(Boolean).join('\n');
     const user = [
       `请撰写投标技术方案中的「${section.title}」一章，目标 ${target} 字（不少于 ${Math.round(target * 0.8)} 字）。`,
       '',
@@ -229,33 +269,43 @@ export async function techAgent(ctx) {
       role: '技术标主笔',
       user,
       maxTokens: Math.min(4000, Math.round(target * 1.8)),
+      timeoutMs: chapterTimeoutMs,
     });
-    let body = String(text || '');
+    let body = stripInstructionEcho(String(text || ''));
     const fallbackNote = body.match(/<!--\s*LLM_FALLBACK:\s*([\s\S]*?)-->/);
     if (fallbackNote) {
       modelErrors.push(fallbackNote[1].trim().slice(0, 200));
       body = body.replace(/<!--\s*LLM_FALLBACK:[\s\S]*?-->/, '').trim();
     }
     let usedModel = body !== section.content && !body.includes('LLM_FALLBACK');
-    // 篇幅不足目标 70%：追加一次补写
-    if (usedModel && body.replace(/\s/g, '').length < target * 0.7) {
+    // 篇幅不足目标 60%：追加一次补写（阈值从 70% 下调，减少补写往返次数）
+    if (usedModel && body.replace(/\s/g, '').length < target * 0.6) {
       const more = await generateText({
         system: `${BASE_STYLE}\n你是技术标主笔，只补写正文，不重复前文。`,
         user: `接着上一节「${section.title}」继续写，补足约 ${Math.max(200, target - body.replace(/\s/g, '').length)} 字，补写「实施保障」「承诺指标」等未展开内容，不要重复前文。只输出正文。`,
         fallback: '',
         tier: 'strong',
         maxTokens: Math.min(3000, Math.round(target * 1.2)),
+        timeoutMs: chapterTimeoutMs,
       });
-      if (more && !String(more).includes('LLM_FALLBACK')) body = `${body}\n\n${more}`;
+      if (more && !String(more).includes('LLM_FALLBACK')) body = stripInstructionEcho(`${body}\n\n${more}`);
     }
-    if (!usedModel) continue;
+    if (!usedModel) return;
     section.content = body;
     section.words = String(body).replace(/\s/g, '').length;
     section.narrative_source = 'llm';
     rewritten += 1;
   }
+
+  // 分批并发：3 章一批，9 章从「9 次串行」变成「3 轮并行」
+  for (let i = 0; i < limit; i += concurrency) {
+    await Promise.all(content.sections.slice(i, i + concurrency).map((section) => rewriteSection(section)));
+  }
   if (rewritten) {
     content.markdown = composeContentMarkdown({ project: { ...analysis.project, name: ctx.project.name }, bidder, sections: content.sections });
+    // 模型重写正文后会重新组装，这里补回量化指标响应表，保证每条可核验指标仍出现在正文中。
+    const metricsTable = iteration === 0 ? '' : metricsResponseMarkdown(analysis);
+    if (metricsTable) content.markdown = `${content.markdown}\n\n${metricsTable}`;
     content.total_words = content.sections.reduce((a, s) => a + s.words, 0);
   }
 
@@ -393,9 +443,27 @@ export async function docAgent(ctx) {
     };
   }
 
-  const fileName = `bid-${ctx.run.id.slice(0, 8)}.docx`;
+  const taken = new Set(
+    all('SELECT file_name FROM exports WHERE project_id=?', ctx.project.id).map((row) => row.file_name),
+  );
+  for (const row of all("SELECT storage_path, payload_json FROM artifacts WHERE kind='doc.docx'")) {
+    const stored = row.storage_path ? path.basename(row.storage_path) : '';
+    if (stored) taken.add(stored);
+    const payload = jparse(row.payload_json, null);
+    const fromPayload = String(payload?.file || '').split('/').filter(Boolean).pop();
+    if (fromPayload) taken.add(fromPayload);
+  }
+  const filesDir = path.join(VAR_DIR, 'files');
+  if (fs.existsSync(filesDir)) {
+    for (const entry of fs.readdirSync(filesDir)) {
+      if (entry.endsWith('.docx')) taken.add(entry);
+    }
+  }
+  const fileName = resolveUniqueFileName(title, '.docx', [...taken]);
   const filePath = path.join(VAR_DIR, 'files', fileName);
-  const { size } = writeDocx(filePath, assembled.markdown, { title, author: ctx.project.bidder_name || 'BidCore', keywords: `run:${ctx.run.id}` });
+  // 按招标文件的版式要求排版（读不到要求时回落到默认版式）
+  const layout = layoutFromFormat(ctx.artifacts?.['tender.format']);
+  const { size } = writeDocx(filePath, assembled.markdown, { title, author: ctx.project.bidder_name || '', keywords: `run:${ctx.run.id}`, layout });
 
   return {
     artifacts: [{
@@ -556,11 +624,14 @@ export async function formatAgent(ctx) {
     }
   }
 
+  // 版式要求（字体/字号/行距/页边距/页码）：从招标正文抽取，导出时按此排版
+  const layout = parseLayoutSpec(text);
+
   return {
     artifacts: [{
       kind: 'tender.format',
-      summary: `投标文件格式 ${items.length} 项，表单 ${forms.length} 个${sectionTitle ? `（来源：${sectionTitle}）` : ''}`,
-      payload: { items, forms, sectionTitle, source, source_name: ctx.project.tender_name || 'tender' },
+      summary: `投标文件格式 ${items.length} 项，表单 ${forms.length} 个${sectionTitle ? `（来源：${sectionTitle}）` : ''}${layout.found ? '，含版式要求' : ''}`,
+      payload: { items, forms, sectionTitle, source, layout, source_name: ctx.project.tender_name || 'tender' },
       provenance: { agent: 'format', locate: source },
     }],
     metrics: { tokens: 0, agent_calls: 0 },
@@ -570,6 +641,7 @@ export async function formatAgent(ctx) {
         : '未定位到投标文件格式章节，按通用 12 项兜底',
       items.length ? `清单：${items.slice(0, 4).map((i) => i.content).join(' / ')}…` : '',
       forms.length ? `必用表单 ${forms.length} 个：${forms.slice(0, 6).map((f) => `格式${f.no} ${f.name}`).join('、')}` : '未检测到必用表单',
+      layout.found ? `版式要求：${layout.evidence.join('；')}` : '未从招标文件读到字体/字号/页边距要求，按默认版式导出',
     ].filter(Boolean),
   };
 }
